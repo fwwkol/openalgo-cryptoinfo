@@ -6,10 +6,10 @@ import os
 import signal
 import atexit
 
-from .server import main as websocket_main
 from utils.logging import get_logger, highlight_url
+from .websocket_proxy_shm import WebSocketProxy as ShmWebSocketProxy
 
-# Set the correct event loop policy for Windows to avoid ZeroMQ warnings
+# Set the correct event loop policy for Windows for better async performance
 if platform.system() == 'Windows':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -50,9 +50,9 @@ def cleanup_websocket_server():
         logger.info("Cleaning up WebSocket server...")
         
         if _websocket_proxy_instance:
-            # For Windows compatibility, set a shutdown flag instead of trying to 
-            # manipulate the event loop from a different thread
-            _websocket_proxy_instance.running = False
+            # Signal the proxy to shutdown
+            if hasattr(_websocket_proxy_instance, 'shutdown_event'):
+                _websocket_proxy_instance.shutdown_event.set()
             
             # Try to close the server gracefully
             try:
@@ -61,21 +61,6 @@ def cleanup_websocket_server():
                         _websocket_proxy_instance.server.close()
                     except Exception as e:
                         logger.warning(f"Error closing server handle: {e}")
-                
-                # Close ZMQ resources immediately
-                if hasattr(_websocket_proxy_instance, 'socket') and _websocket_proxy_instance.socket:
-                    try:
-                        import zmq
-                        _websocket_proxy_instance.socket.setsockopt(zmq.LINGER, 0)
-                        _websocket_proxy_instance.socket.close()
-                    except Exception as e:
-                        logger.warning(f"Error closing ZMQ socket: {e}")
-                
-                if hasattr(_websocket_proxy_instance, 'context') and _websocket_proxy_instance.context:
-                    try:
-                        _websocket_proxy_instance.context.term()
-                    except Exception as e:
-                        logger.warning(f"Error terminating ZMQ context: {e}")
                         
             except Exception as e:
                 logger.error(f"Error during WebSocket cleanup: {e}")
@@ -88,7 +73,7 @@ def cleanup_websocket_server():
             if _websocket_thread.is_alive():
                 logger.warning("WebSocket thread did not finish gracefully")
             _websocket_thread = None
-            
+        
         logger.info("WebSocket server cleanup completed")
         
     except Exception as e:
@@ -119,25 +104,27 @@ def start_websocket_server():
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            
-            # Import here to avoid circular imports
-            from .server import WebSocketProxy
-            import os
-            from dotenv import load_dotenv
-            
-            load_dotenv()
-            ws_host = os.getenv('WEBSOCKET_HOST', '127.0.0.1')
-            ws_port = int(os.getenv('WEBSOCKET_PORT', '8765'))
-            
-            # Create and store the proxy instance
-            _websocket_proxy_instance = WebSocketProxy(host=ws_host, port=ws_port)
-            
-            # Start the proxy
+
+            # Use the shared-memory based WebSocket proxy (consumes from ring buffer)
+            _websocket_proxy_instance = ShmWebSocketProxy()
+
+            # Start the proxy (async) - this will run until shutdown
             loop.run_until_complete(_websocket_proxy_instance.start())
             
+        except KeyboardInterrupt:
+            logger.info("WebSocket server interrupted")
         except Exception as e:
             logger.exception(f"Error in WebSocket server thread: {e}")
-            _websocket_proxy_instance = None
+        finally:
+            # Clean up the event loop
+            try:
+                if _websocket_proxy_instance:
+                    loop.run_until_complete(_websocket_proxy_instance.shutdown())
+            except Exception as e:
+                logger.warning(f"Error during proxy shutdown: {e}")
+            finally:
+                _websocket_proxy_instance = None
+                loop.close()
     
     # Start the WebSocket server in a daemon thread
     _websocket_thread = threading.Thread(

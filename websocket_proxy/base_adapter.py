@@ -1,163 +1,41 @@
 import json
-import threading
-import zmq
-import random
-import socket
 import os
 from abc import ABC, abstractmethod
 from utils.logging import get_logger
+from .shm_publisher import SharedMemoryPublisher
 
 # Initialize logger
 logger = get_logger(__name__)
-
-def is_port_available(port):
-    """
-    Check if a port is available for use
-    """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.settimeout(1.0)
-            s.bind(("127.0.0.1", port))
-            return True
-    except socket.error:
-        return False
-
-def find_free_zmq_port(start_port=5556, max_attempts=50):
-    """
-    Find an available port starting from start_port that's not already bound
-    
-    Args:
-        start_port (int): Port number to start the search from
-        max_attempts (int): Maximum number of attempts to find a free port
-        
-    Returns:
-        int: Available port number, or None if no port is available
-    """
-    # Create logger here instead of using self.logger because this is a standalone function
-    logger = get_logger("zmq_port_finder")
-    
-    # First check if any ports in the bound_ports set are actually free now
-    # This handles cases where the process that had the port died without cleanup
-    with BaseBrokerWebSocketAdapter._port_lock:
-        ports_to_remove = [port for port in BaseBrokerWebSocketAdapter._bound_ports 
-                          if is_port_available(port)]
-        
-        # Remove ports that are actually available now
-        for port in ports_to_remove:
-            BaseBrokerWebSocketAdapter._bound_ports.remove(port)
-            logger.info(f"Port {port} removed from bound ports registry")
-    
-    # Now find a new free port
-    for _ in range(max_attempts):
-        # Try a sequential port first, then random if that fails
-        if (start_port not in BaseBrokerWebSocketAdapter._bound_ports and 
-            is_port_available(start_port)):
-            return start_port
-            
-        # Try a random port between start_port and 65535
-        random_port = random.randint(start_port, 65535)
-        if (random_port not in BaseBrokerWebSocketAdapter._bound_ports and 
-            is_port_available(random_port)):
-            return random_port
-            
-        start_port = min(start_port + 1, 65000)
-    
-    # If we get here, we couldn't find an available port 
-    logger.error("Failed to find an available port after maximum attempts")
-    return None
 
 class BaseBrokerWebSocketAdapter(ABC):
     """
     Base class for all broker-specific WebSocket adapters that implements
     common functionality and defines the interface for broker-specific implementations.
+    Uses shared memory for market data publishing (no ZeroMQ).
     """
-    # Class variable to track bound ports across instances
-    _bound_ports = set()
-    _port_lock = threading.Lock()
-    _shared_context = None
-    _context_lock = threading.Lock()
     
     def __init__(self):
         self.logger = get_logger("broker_adapter")
-        self.logger.info("BaseBrokerWebSocketAdapter initializing")
+        self.logger.info("BaseBrokerWebSocketAdapter initializing (SHM-only mode)")
         
         try:
-            # Initialize shared ZeroMQ context
-            self._initialize_shared_context()
-            
-            # Create socket and bind to port
-            self.socket = self._create_socket()
-            self.zmq_port = self._bind_to_available_port()
-            os.environ["ZMQ_PORT"] = str(self.zmq_port)
-            
             # Initialize instance variables
             self.subscriptions = {}
             self.connected = False
             
-            self.logger.info(f"BaseBrokerWebSocketAdapter initialized on port {self.zmq_port}")
+            # Initialize shared memory publisher for ring buffer flow
+            shm_buffer_name = os.getenv('SHM_BUFFER_NAME', 'ws_proxy_buffer')
+            try:
+                self.shm_publisher = SharedMemoryPublisher(buffer_name=shm_buffer_name)
+                self.logger.info(f"SharedMemoryPublisher initialized with buffer '{shm_buffer_name}'")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize SharedMemoryPublisher: {e}")
+                self.shm_publisher = None
             
+            self.logger.info("BaseBrokerWebSocketAdapter initialized successfully")
         except Exception as e:
             self.logger.error(f"Error in BaseBrokerWebSocketAdapter init: {e}")
             raise
-    
-    def _initialize_shared_context(self):
-        """
-        Initialize shared ZeroMQ context if not already created
-        """
-        with self._context_lock:
-            if not BaseBrokerWebSocketAdapter._shared_context:
-                self.logger.info("Creating shared ZMQ context")
-                BaseBrokerWebSocketAdapter._shared_context = zmq.Context()
-        
-        self.context = BaseBrokerWebSocketAdapter._shared_context
-    
-    def _create_socket(self):
-        """
-        Create and configure ZeroMQ socket
-        """
-        with self._context_lock:
-            socket = self.context.socket(zmq.PUB)
-            socket.setsockopt(zmq.LINGER, 1000)  # 1 second linger
-            socket.setsockopt(zmq.SNDHWM, 1000)  # High water mark
-            return socket
-        
-    def _bind_to_available_port(self):
-        """
-        Find an available port and bind the socket to it
-        """
-        with self._port_lock:
-            # Try default port from environment first
-            default_port = int(os.getenv('ZMQ_PORT', '5555'))
-            
-            if (default_port not in self._bound_ports and 
-                is_port_available(default_port)):
-                try:
-                    self.socket.bind(f"tcp://*:{default_port}")
-                    self._bound_ports.add(default_port)
-                    self.logger.info(f"Bound to default port {default_port}")
-                    return default_port
-                except zmq.ZMQError as e:
-                    self.logger.warning(f"Failed to bind to default port {default_port}: {e}")
-            
-            # Find random available port
-            for attempt in range(5):
-                port = find_free_zmq_port(start_port=5556 + random.randint(0, 1000))
-                
-                if not port:
-                    self.logger.warning(f"Failed to find free port on attempt {attempt+1}")
-                    continue
-                    
-                try:
-                    self.socket.bind(f"tcp://*:{port}")
-                    self._bound_ports.add(port)
-                    self.logger.info(f"Successfully bound to port {port}")
-                    return port
-                except zmq.ZMQError as e:
-                    self.logger.warning(f"Failed to bind to port {port}: {e}")
-                    continue
-            
-            raise RuntimeError("Could not bind to any available ZMQ port after multiple attempts")
         
     @abstractmethod
     def initialize(self, broker_name, user_id, auth_data=None):
@@ -216,49 +94,58 @@ class BaseBrokerWebSocketAdapter(ABC):
         """
         pass
         
-    def cleanup_zmq(self):
+    def cleanup(self):
         """
-        Properly clean up ZeroMQ resources and release bound ports
+        Clean up adapter resources.
         """
         try:
-            # Release the port from the bound ports set
-            if hasattr(self, 'zmq_port'):
-                with self._port_lock:
-                    self._bound_ports.discard(self.zmq_port)
-                    self.logger.info(f"Released port {self.zmq_port}")
-            
-            # Close the socket
-            if hasattr(self, 'socket') and self.socket:
-                self.socket.close(linger=0)  # Don't linger on close
-                self.logger.info("ZeroMQ socket closed")
-                
+            if hasattr(self, 'shm_publisher') and self.shm_publisher:
+                self.shm_publisher.cleanup()
         except Exception as e:
-            self.logger.exception(f"Error cleaning up ZeroMQ resources: {e}")
+            self.logger.error(f"Error during cleanup: {e}")
             
     def __del__(self):
         """
-        Destructor to ensure ZeroMQ resources are properly cleaned up
+        Destructor to ensure resources are properly cleaned up
         """
         try:
-            self.cleanup_zmq()
-        except Exception as e:
-            # Can't use self.logger here as it might be gone during destruction
-            logger.exception(f"Error in __del__ cleaning up ZMQ resources: {e}")
+            self.cleanup()
+        except Exception:
             pass
     
     def publish_market_data(self, topic, data):
         """
-        Publish market data to ZeroMQ subscribers
+        Publish market data to shared-memory ring buffer
         
         Args:
             topic: Topic string for subscriber filtering (e.g., 'NSE_RELIANCE_LTP')
             data: Market data dictionary
         """
         try:
-            self.socket.send_multipart([
-                topic.encode('utf-8'),
-                json.dumps(data).encode('utf-8')
-            ])
+            # Prefer SHM publisher when available
+            if getattr(self, 'shm_publisher', None) is not None:
+                # Extract symbol from topic pattern "EXCHANGE_SYMBOL_MODE" if possible
+                symbol = None
+                try:
+                    parts = str(topic).split('_')
+                    if len(parts) >= 2:
+                        symbol = parts[1]
+                except Exception:
+                    symbol = None
+
+                if not symbol:
+                    symbol = data.get('symbol') if isinstance(data, dict) else None
+                if not symbol:
+                    # Fallback to whole topic as symbol identifier
+                    symbol = str(topic)
+
+                published = self.shm_publisher.publish_market_data(symbol, data if isinstance(data, dict) else {})
+                if not published:
+                    self.logger.debug("SHM publish returned False (buffer full or not ready)")
+                return
+
+            # If SHM publisher isn't available, log a debug message
+            self.logger.debug("No SHM publisher available to publish market data")
         except Exception as e:
             self.logger.exception(f"Error publishing market data: {e}")
     
