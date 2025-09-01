@@ -1,6 +1,6 @@
 """
-Flattrade SHM WebSocket Adapter for OpenAlgo
-Publishes market data directly to the Shared Memory ring buffer (no ZeroMQ).
+Flattrade SHM WebSocket Adapter for OpenAlgo - Updated with OHLC Support
+Publishes market data directly to the Shared Memory ring buffer with preserved OHLC data.
 """
 import threading
 import json
@@ -10,8 +10,10 @@ from typing import Dict, Any, Optional, List
 import os
 
 from database.auth_db import get_auth_token
-from websocket_proxy.shm_publisher import SharedMemoryPublisher
+from websocket_proxy.optimized_ring_buffer import OptimizedRingBuffer
 from websocket_proxy.mapping import SymbolMapper
+from websocket_proxy.binary_market_data import BinaryMarketData
+from websocket_proxy.market_data import MarketDataMessage
 from .flattrade_mapping import FlattradeExchangeMapper
 from .flattrade_websocket import FlattradeWebSocket
 
@@ -67,10 +69,10 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 
 class FlattradeSHMWebSocketAdapter:
-    """Flattrade adapter that publishes to SHM ring buffer only."""
+    """Flattrade adapter that publishes to SHM ring buffer with full OHLC support."""
 
     def __init__(self, shm_buffer_name: str = None):
-        self.logger = logging.getLogger("flattrade_websocket_shm")
+        self.logger = logging.getLogger("flattrade_adapter_shm")
         self.user_id: Optional[str] = None
         self.broker_name = "flattrade"
         self.ws_client: Optional[FlattradeWebSocket] = None
@@ -83,14 +85,14 @@ class FlattradeSHMWebSocketAdapter:
         self.lock = threading.Lock()
         self.reconnect_attempts = 0
 
-        # SHM publisher
+        # SHM ring buffer
         buffer_name = shm_buffer_name or os.getenv('SHM_BUFFER_NAME', 'ws_proxy_buffer')
         try:
-            self.shm_publisher = SharedMemoryPublisher(buffer_name=buffer_name)
-            self.logger.info(f"SharedMemoryPublisher initialized with buffer '{buffer_name}'")
+            self.ring_buffer = OptimizedRingBuffer(name=buffer_name, create=False)
+            self.logger.info(f"OptimizedRingBuffer initialized with buffer '{buffer_name}'")
         except Exception as e:
-            self.logger.error(f"Failed to initialize SharedMemoryPublisher: {e}")
-            self.shm_publisher = None
+            self.logger.error(f"Failed to initialize OptimizedRingBuffer: {e}")
+            self.ring_buffer = None
 
     def initialize(self, broker_name: str, user_id: str, auth_data: Optional[Dict[str, str]] = None) -> None:
         self.user_id = user_id
@@ -133,7 +135,6 @@ class FlattradeSHMWebSocketAdapter:
         self.running = False
         if self.ws_client:
             self.ws_client.stop()
-        # No ZMQ to clean
         self.connected = False
         self.logger.info("Disconnected from Flattrade WebSocket (SHM mode)")
 
@@ -170,18 +171,7 @@ class FlattradeSHMWebSocketAdapter:
         return {"status": "success", "message": f"Subscribed to {symbol}.{exchange}", "symbol": symbol, "exchange": exchange, "mode": mode}
 
     def unsubscribe(self, symbol: str, exchange: str, mode: int = Config.MODE_QUOTE) -> Dict[str, Any]:
-        """
-        Unsubscribe from symbol with enhanced error handling and state validation.
-        
-        Args:
-            symbol: Symbol to unsubscribe from
-            exchange: Exchange for the symbol
-            mode: Subscription mode (LTP, QUOTE, DEPTH)
-            
-        Returns:
-            Dict containing status and message
-        """
-        # Validate input parameters
+        """Unsubscribe from symbol with enhanced error handling and state validation."""
         if not symbol or not exchange:
             self.logger.warning(f"Invalid unsubscribe parameters: symbol='{symbol}', exchange='{exchange}'")
             return {"status": "error", "code": "INVALID_PARAMS", "message": "Symbol and exchange are required"}
@@ -193,15 +183,9 @@ class FlattradeSHMWebSocketAdapter:
         correlation_id = f"{symbol}_{exchange}_{mode}"
         
         with self.lock:
-            # Check if subscription exists
             if correlation_id not in self.subscriptions:
-                # This is a recoverable state mismatch - log as warning, not error
-                self.logger.warning(f"Unsubscribe requested for {symbol}.{exchange} mode={mode} but not found in subscriptions. "
-                                  f"Available subscriptions: {list(self.subscriptions.keys())}")
-                
-                # Still attempt to clean up any orphaned websocket subscriptions
+                self.logger.warning(f"Unsubscribe requested for {symbol}.{exchange} mode={mode} but not found in subscriptions.")
                 self._cleanup_orphaned_subscription(symbol, exchange, mode)
-                
                 return {
                     "status": "success", 
                     "message": f"Already unsubscribed from {symbol}.{exchange}", 
@@ -212,7 +196,6 @@ class FlattradeSHMWebSocketAdapter:
             
             subscription = self.subscriptions[correlation_id]
             
-            # Attempt websocket unsubscribe with error handling
             try:
                 self.logger.debug(f"Attempting websocket unsubscribe for {symbol}.{exchange} mode={mode}")
                 unsubscribe_success = self._websocket_unsubscribe(subscription)
@@ -223,10 +206,8 @@ class FlattradeSHMWebSocketAdapter:
             except Exception as e:
                 self.logger.warning(f"Error during websocket unsubscribe for {symbol}.{exchange}: {e}, continuing with cleanup")
             
-            # Always clean up local subscription state regardless of websocket result
             del self.subscriptions[correlation_id]
             
-            # Clean up token mapping if no other subscriptions exist for this token
             token = subscription.get('token')
             if token and not any(sub.get('token') == token for sub in self.subscriptions.values()):
                 self.token_to_symbol.pop(token, None)
@@ -259,15 +240,7 @@ class FlattradeSHMWebSocketAdapter:
             self.ws_subscription_refs[scrip]['depth_count'] += 1
 
     def _websocket_unsubscribe(self, subscription: Dict) -> bool:
-        """
-        Unsubscribe from websocket with enhanced error handling and reference counting.
-        
-        Args:
-            subscription: Subscription dictionary containing scrip and mode
-            
-        Returns:
-            bool: True if unsubscribe was successful, False otherwise
-        """
+        """Unsubscribe from websocket with enhanced error handling and reference counting."""
         scrip = subscription.get('scrip')
         mode = subscription.get('mode')
         
@@ -277,16 +250,14 @@ class FlattradeSHMWebSocketAdapter:
         
         self.logger.debug(f"[BROKER<-APP] unsubscribe: scrip={scrip} mode={mode}")
         
-        # Check if we have reference tracking for this scrip
         if scrip not in self.ws_subscription_refs:
             self.logger.warning(f"No websocket subscription references found for {scrip}")
-            return True  # Consider this successful since it's already unsubscribed
+            return True
         
         success = True
         
         try:
             if mode in [Config.MODE_LTP, Config.MODE_QUOTE]:
-                # Handle touchline unsubscription
                 current_count = self.ws_subscription_refs[scrip]['touchline_count']
                 if current_count <= 0:
                     self.logger.warning(f"Touchline count already 0 for {scrip}, skipping unsubscribe")
@@ -303,11 +274,9 @@ class FlattradeSHMWebSocketAdapter:
                     else:
                         self.logger.warning(f"WebSocket client not available for touchline unsubscribe: {scrip}")
                     
-                    # Reset count to 0 regardless of websocket result
                     self.ws_subscription_refs[scrip]['touchline_count'] = 0
                     
             elif mode == Config.MODE_DEPTH:
-                # Handle depth unsubscription
                 current_count = self.ws_subscription_refs[scrip]['depth_count']
                 if current_count <= 0:
                     self.logger.warning(f"Depth count already 0 for {scrip}, skipping unsubscribe")
@@ -324,10 +293,8 @@ class FlattradeSHMWebSocketAdapter:
                     else:
                         self.logger.warning(f"WebSocket client not available for depth unsubscribe: {scrip}")
                     
-                    # Reset count to 0 regardless of websocket result
                     self.ws_subscription_refs[scrip]['depth_count'] = 0
             
-            # Clean up scrip reference if both counts are 0
             if (self.ws_subscription_refs[scrip]['touchline_count'] <= 0 and 
                 self.ws_subscription_refs[scrip]['depth_count'] <= 0):
                 del self.ws_subscription_refs[scrip]
@@ -340,19 +307,8 @@ class FlattradeSHMWebSocketAdapter:
         return success
 
     def _cleanup_orphaned_subscription(self, symbol: str, exchange: str, mode: int) -> None:
-        """
-        Clean up any orphaned websocket subscriptions that might exist without local tracking.
-        
-        Args:
-            symbol: Symbol to clean up
-            exchange: Exchange for the symbol
-            mode: Subscription mode
-        """
+        """Clean up any orphaned websocket subscriptions."""
         try:
-            # Try to get token info to construct scrip
-            from websocket_proxy.mapping import SymbolMapper
-            from .flattrade_mapping import FlattradeExchangeMapper
-            
             token_info = SymbolMapper.get_token_from_symbol(symbol, exchange)
             if not token_info:
                 self.logger.debug(f"Cannot cleanup orphaned subscription - token not found for {symbol}.{exchange}")
@@ -363,7 +319,6 @@ class FlattradeSHMWebSocketAdapter:
             flattrade_exchange = FlattradeExchangeMapper.to_flattrade_exchange(brexchange)
             scrip = f"{flattrade_exchange}|{token}"
             
-            # Create a temporary subscription object for cleanup
             temp_subscription = {
                 'scrip': scrip,
                 'mode': mode,
@@ -376,118 +331,6 @@ class FlattradeSHMWebSocketAdapter:
             
         except Exception as e:
             self.logger.debug(f"Error during orphaned subscription cleanup for {symbol}.{exchange}: {e}")
-
-    def get_subscription_stats(self) -> Dict[str, Any]:
-        """
-        Get current subscription statistics for debugging and monitoring.
-        
-        Returns:
-            Dict containing subscription statistics
-        """
-        with self.lock:
-            stats = {
-                'total_subscriptions': len(self.subscriptions),
-                'subscription_details': {},
-                'websocket_refs': dict(self.ws_subscription_refs),
-                'token_mappings': len(self.token_to_symbol),
-                'connected': self.connected,
-                'running': self.running
-            }
-            
-            # Group subscriptions by symbol for easier debugging
-            for correlation_id, sub in self.subscriptions.items():
-                symbol = sub.get('symbol', 'unknown')
-                if symbol not in stats['subscription_details']:
-                    stats['subscription_details'][symbol] = []
-                stats['subscription_details'][symbol].append({
-                    'exchange': sub.get('exchange'),
-                    'mode': sub.get('mode'),
-                    'correlation_id': correlation_id,
-                    'scrip': sub.get('scrip')
-                })
-            
-            return stats
-
-    def validate_subscription_state(self) -> Dict[str, Any]:
-        """
-        Validate consistency between different subscription tracking mechanisms.
-        
-        Returns:
-            Dict containing validation results and any inconsistencies found
-        """
-        with self.lock:
-            issues = []
-            
-            # Check for orphaned websocket references
-            for scrip, refs in self.ws_subscription_refs.items():
-                has_local_subs = any(sub.get('scrip') == scrip for sub in self.subscriptions.values())
-                if not has_local_subs and (refs['touchline_count'] > 0 or refs['depth_count'] > 0):
-                    issues.append(f"Orphaned websocket reference for {scrip}: {refs}")
-            
-            # Check for missing websocket references
-            for correlation_id, sub in self.subscriptions.items():
-                scrip = sub.get('scrip')
-                if scrip and scrip not in self.ws_subscription_refs:
-                    issues.append(f"Missing websocket reference for subscription {correlation_id} (scrip: {scrip})")
-            
-            return {
-                'is_valid': len(issues) == 0,
-                'issues': issues,
-                'total_subscriptions': len(self.subscriptions),
-                'total_ws_refs': len(self.ws_subscription_refs)
-            }
-
-    def _cleanup_orphaned_subscription(self, symbol: str, exchange: str, mode: int) -> None:
-        """
-        Clean up any orphaned websocket subscriptions that might exist without local tracking.
-        
-        Args:
-            symbol: Symbol to clean up
-            exchange: Exchange for the symbol
-            mode: Subscription mode
-        """
-        try:
-            # Try to get token info to construct scrip
-            from websocket_proxy.mapping import SymbolMapper
-            from .flattrade_mapping import FlattradeExchangeMapper
-            
-            token_info = SymbolMapper.get_token_from_symbol(symbol, exchange)
-            if not token_info:
-                self.logger.debug(f"Cannot clean up orphaned subscription - token not found for {symbol}.{exchange}")
-                return
-            
-            token = token_info['token']
-            brexchange = token_info['brexchange']
-            flattrade_exchange = FlattradeExchangeMapper.to_flattrade_exchange(brexchange)
-            scrip = f"{flattrade_exchange}|{token}"
-            
-            # Check if there are any websocket references for this scrip
-            if scrip in self.ws_subscription_refs:
-                self.logger.info(f"Cleaning up orphaned websocket subscription for {scrip}")
-                
-                # Force cleanup based on mode
-                if mode in [Config.MODE_LTP, Config.MODE_QUOTE] and self.ws_subscription_refs[scrip]['touchline_count'] > 0:
-                    if self.ws_client and self.connected:
-                        self.ws_client.unsubscribe_touchline(scrip)
-                    self.ws_subscription_refs[scrip]['touchline_count'] = 0
-                
-                if mode == Config.MODE_DEPTH and self.ws_subscription_refs[scrip]['depth_count'] > 0:
-                    if self.ws_client and self.connected:
-                        self.ws_client.unsubscribe_depth(scrip)
-                    self.ws_subscription_refs[scrip]['depth_count'] = 0
-                
-                # Remove scrip reference if both counts are 0
-                if (self.ws_subscription_refs[scrip]['touchline_count'] <= 0 and 
-                    self.ws_subscription_refs[scrip]['depth_count'] <= 0):
-                    del self.ws_subscription_refs[scrip]
-                    
-            # Clean up token mapping if it exists
-            if token in self.token_to_symbol:
-                del self.token_to_symbol[token]
-                self.logger.debug(f"Cleaned up orphaned token mapping for {token}")
-                
-        except Exception as e:
-            self.logger.warning(f"Error cleaning up orphaned subscription for {symbol}.{exchange}: {e}")
 
     def _on_open(self, ws):
         self.logger.info("Connected to Flattrade WebSocket")
@@ -548,7 +391,6 @@ class FlattradeSHMWebSocketAdapter:
             self.logger.error(f"Reconnection error: {e}")
 
     def _on_message(self, ws, message):
-        # Raw inbound from broker
         self.logger.debug(f"[BROKER->APP] raw: {message}")
         try:
             data = json.loads(message)
@@ -616,7 +458,7 @@ class FlattradeSHMWebSocketAdapter:
                 'last_trade_time': data.get('ltt'),
                 'flattrade_timestamp': safe_int(data.get('ft')),
             }
-        # DEPTH
+        # DEPTH mode with enhanced depth data
         result = {
             'mode': Config.MODE_DEPTH,
             'ltp': safe_float(data.get('lp')),
@@ -633,6 +475,8 @@ class FlattradeSHMWebSocketAdapter:
             'total_sell_quantity': safe_int(data.get('tsq')),
             'flattrade_timestamp': safe_int(data.get('ft')),
         }
+        
+        # Enhanced depth data in multiple formats
         result['depth'] = {
             'buy': [
                 {'price': safe_float(data.get('bp1')), 'quantity': safe_int(data.get('bq1')), 'orders': safe_int(data.get('bo1'))},
@@ -649,18 +493,58 @@ class FlattradeSHMWebSocketAdapter:
                 {'price': safe_float(data.get('sp5')), 'quantity': safe_int(data.get('sq5')), 'orders': safe_int(data.get('so5'))},
             ],
         }
+        
         result['depth_level'] = 5
         return result
 
     def _publish_market_data(self, topic: str, data: Dict[str, Any]) -> None:
-        if self.shm_publisher is None:
-            self.logger.debug("SHM publisher not available; drop message")
+        """
+        Enhanced publish method that preserves OHLC data using the new binary format.
+        """
+        if self.ring_buffer is None:
+            self.logger.debug("Ring buffer not available; drop message")
             return
-        # Extract symbol from topic pattern "EXCHANGE_SYMBOL_MODE"
-        parts = str(topic).split('_')
-        symbol = data.get('symbol') or (parts[1] if len(parts) >= 2 else topic)
-        ok = self.shm_publisher.publish_market_data(symbol, data)
-        if not ok:
-            self.logger.debug(f"[APP->SHM] publish failed for symbol={symbol}")
-        else:
-            self.logger.debug(f"[APP->SHM] published symbol={symbol}")
+        
+        try:
+            symbol = data.get('symbol', '')
+            exchange = data.get('exchange', 'NSE')
+            mode = data.get('mode', 1)
+            
+            # For depth data (mode 3), preserve full depth structure by using dict format
+            if mode == 3:
+                ltp_value = data.get('ltp', 0) or data.get('price', 0)
+                price_float = float(ltp_value) if ltp_value else 0.0
+                
+                self.logger.debug(f"Price conversion - ltp_value: {ltp_value}, price_float: {price_float}")
+                
+                enriched_data = data.copy()
+                enriched_data.update({
+                    'price': price_float,
+                    'ltp': price_float,
+                })
+                
+                self.logger.debug(f"Depth data preserved - symbol: {symbol}, depth levels: {len(data.get('depth', {}).get('buy', []))}")
+                
+                published = self.ring_buffer.publish_single(enriched_data)
+                if not published:
+                    self.logger.debug(f"[APP->SHM] publish failed for symbol={symbol} (buffer full)")
+                else:
+                    self.logger.debug(f"[APP->SHM] published depth data for symbol={symbol}")
+            else:
+                # For LTP/Quote modes, use the new enhanced binary format that preserves OHLC
+                self.logger.debug(f"Publishing OHLC data for {symbol}: O={data.get('open', 0)}, H={data.get('high', 0)}, L={data.get('low', 0)}, C={data.get('close', 0)}")
+                
+                # Create binary message using the new from_normalized_data method
+                binary_msg = BinaryMarketData.from_normalized_data(data, exchange)
+                
+                self.logger.debug(f"Binary message created - price: {binary_msg.get_price_float()}, symbol: {binary_msg.get_symbol_string()}, open: {binary_msg.get_open_price_float()}")
+                
+                published = self.ring_buffer.publish_single(binary_msg)
+                if not published:
+                    self.logger.debug(f"[APP->SHM] publish failed for symbol={symbol} (buffer full)")
+                else:
+                    self.logger.debug(f"[APP->SHM] published symbol={symbol}")
+                
+        except Exception as e:
+            self.logger.error(f"Error publishing market data for {topic}: {e}")
+            self.logger.debug(f"Failed data: {data}")

@@ -1,114 +1,96 @@
+"""
+Flask Integration for Shared Memory WebSocket Proxy
+Clean integration without ZeroMQ dependencies
+"""
+
 import asyncio
 import threading
-import sys
 import platform
 import os
 import signal
 import atexit
 
-from utils.logging import get_logger, highlight_url
-from .websocket_proxy_shm import WebSocketProxy as ShmWebSocketProxy
+from utils.logging import get_logger
+from .websocket_proxy_shm import WebSocketProxy
 
-# Set the correct event loop policy for Windows for better async performance
+# Set correct event loop policy for Windows
 if platform.system() == 'Windows':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# Global flag to track if the WebSocket server has been started
-# Used to prevent multiple instances in Flask debug mode
+# Global state
 _websocket_server_started = False
 _websocket_proxy_instance = None
 _websocket_thread = None
 
 logger = get_logger(__name__)
 
-# Check if we're in the Flask child process that should start the WebSocket server
 def should_start_websocket():
-    """
-    Determine if the current process should start the WebSocket server
-    
-    In Flask debug mode with reloader enabled, we only want to start the
-    WebSocket server in the child process, not the parent process that
-    monitors for file changes.
-    
-    Returns:
-        bool: True if we should start the WebSocket server, False otherwise
-    """
-    # In debug mode, only start in the Flask child process
+    """Determine if current process should start WebSocket server"""
+    # In debug mode, only start in Flask child process
     if os.environ.get('FLASK_DEBUG', '').lower() in ('1', 'true'):
-        # WERKZEUG_RUN_MAIN is set to 'true' by Flask in the child process
-        # that actually runs the application
         return os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
-    
-    # In non-debug mode, always start
     return True
 
 def cleanup_websocket_server():
-    """Clean up WebSocket server resources - cross-platform compatible"""
+    """Clean up WebSocket server resources"""
     global _websocket_proxy_instance, _websocket_thread
     
     try:
         logger.info("Cleaning up WebSocket server...")
         
         if _websocket_proxy_instance:
-            # Signal the proxy to shutdown
+            # Signal shutdown
             if hasattr(_websocket_proxy_instance, 'shutdown_event'):
                 _websocket_proxy_instance.shutdown_event.set()
             
-            # Try to close the server gracefully
+            # Close server gracefully
             try:
                 if hasattr(_websocket_proxy_instance, 'server') and _websocket_proxy_instance.server:
-                    try:
-                        _websocket_proxy_instance.server.close()
-                    except Exception as e:
-                        logger.warning(f"Error closing server handle: {e}")
-                        
+                    _websocket_proxy_instance.server.close()
             except Exception as e:
-                logger.error(f"Error during WebSocket cleanup: {e}")
-            finally:
-                _websocket_proxy_instance = None
+                logger.warning(f"Error closing server: {e}")
+            
+            _websocket_proxy_instance = None
         
         if _websocket_thread and _websocket_thread.is_alive():
             logger.info("Waiting for WebSocket thread to finish...")
-            _websocket_thread.join(timeout=3.0)  # Reduced timeout for faster shutdown
+            _websocket_thread.join(timeout=3.0)
+            
             if _websocket_thread.is_alive():
                 logger.warning("WebSocket thread did not finish gracefully")
-            _websocket_thread = None
         
+        _websocket_thread = None
         logger.info("WebSocket server cleanup completed")
         
     except Exception as e:
         logger.error(f"Error during WebSocket cleanup: {e}")
-        # Last resort: force cleanup
         _websocket_proxy_instance = None
         _websocket_thread = None
 
 def signal_handler(signum, frame):
-    """Handle SIGINT (Ctrl+C) and SIGTERM signals"""
+    """Handle shutdown signals"""
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
     cleanup_websocket_server()
-    # Use os._exit() for immediate termination across all platforms
     os._exit(0)
 
 def start_websocket_server():
-    """
-    Start the WebSocket proxy server in a separate thread.
-    This function should be called when the Flask app starts.
-    """
+    """Start WebSocket proxy server in separate thread"""
     global _websocket_proxy_instance, _websocket_thread
     
-    logger.info("Starting WebSocket proxy server in a separate thread")
+    logger.info("Starting WebSocket proxy server in separate thread")
     
     def run_websocket_server():
-        """Run the WebSocket server in an event loop"""
+        """Run WebSocket server in event loop"""
         global _websocket_proxy_instance
+        
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-
-            # Use the shared-memory based WebSocket proxy (consumes from ring buffer)
-            _websocket_proxy_instance = ShmWebSocketProxy()
-
-            # Start the proxy (async) - this will run until shutdown
+            
+            # Create shared memory WebSocket proxy
+            _websocket_proxy_instance = WebSocketProxy()
+            
+            # Start proxy
             loop.run_until_complete(_websocket_proxy_instance.start())
             
         except KeyboardInterrupt:
@@ -116,7 +98,7 @@ def start_websocket_server():
         except Exception as e:
             logger.exception(f"Error in WebSocket server thread: {e}")
         finally:
-            # Clean up the event loop
+            # Clean up event loop
             try:
                 if _websocket_proxy_instance:
                     loop.run_until_complete(_websocket_proxy_instance.shutdown())
@@ -126,23 +108,21 @@ def start_websocket_server():
                 _websocket_proxy_instance = None
                 loop.close()
     
-    # Start the WebSocket server in a daemon thread
+    # Start WebSocket server thread
     _websocket_thread = threading.Thread(
         target=run_websocket_server,
-        daemon=False  # Changed to False so we can properly clean up
+        daemon=False  # Allow proper cleanup
     )
     _websocket_thread.start()
     
     # Register cleanup handlers
     atexit.register(cleanup_websocket_server)
     
-    # Register signal handlers for graceful shutdown
+    # Register signal handlers
     try:
-        # SIGINT (Ctrl+C) - Available on all platforms
         signal.signal(signal.SIGINT, signal_handler)
         signals_registered = ["SIGINT"]
         
-        # SIGTERM - Available on Unix-like systems (Mac, Linux)
         if hasattr(signal, 'SIGTERM'):
             signal.signal(signal.SIGTERM, signal_handler)
             signals_registered.append("SIGTERM")
@@ -153,20 +133,16 @@ def start_websocket_server():
     
     logger.info("WebSocket proxy server thread started")
     return _websocket_thread
-    
+
 def start_websocket_proxy(app):
     """
-    Integrate the WebSocket proxy server with a Flask application.
-    This should be called during app initialization.
-    
+    Integrate WebSocket proxy server with Flask application
     Args:
         app: Flask application instance
     """
     global _websocket_server_started
     
-    # Check if this process should start the WebSocket server
     if should_start_websocket():
-        # Our flag will prevent multiple starts if called multiple times
         if not _websocket_server_started:
             _websocket_server_started = True
             logger.info("Starting WebSocket server in Flask application process")

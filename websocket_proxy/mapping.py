@@ -111,7 +111,7 @@ class BrokerCapabilityRegistry:
             requested_depth (int): Requested depth level
             
         Returns:
-            int: Highest supported depth level that is ≤ requested depth
+            int: Highest supported depth level that is â‰¤ requested depth
         """
         supported_depths = cls.get_supported_depth_levels(broker, exchange)
         # Find the highest supported depth that's less than or equal to requested depth

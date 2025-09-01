@@ -1,4 +1,5 @@
 """Market data message format for shared memory communication."""
+
 import json
 import struct
 from dataclasses import dataclass
@@ -8,9 +9,11 @@ from typing import Dict, Any, Optional
 @dataclass
 class MarketDataMessage:
     """Market data message structure for efficient serialization."""
+    
     symbol: str
     timestamp: float
     price: float
+    exchange: str = "NSE"  # ADD THIS FIELD
     volume: float = 0.0
     bid_price: float = 0.0
     ask_price: float = 0.0
@@ -23,9 +26,11 @@ class MarketDataMessage:
     average_price: float = 0.0
     percent_change: float = 0.0
     last_quantity: float = 0.0
+    
     # Totals
     total_buy_quantity: float = 0.0
     total_sell_quantity: float = 0.0
+    
     # Depth levels (5 levels each side): price, quantity, orders
     bid_price_1: float = 0.0
     bid_qty_1: float = 0.0
@@ -42,6 +47,7 @@ class MarketDataMessage:
     bid_price_5: float = 0.0
     bid_qty_5: float = 0.0
     bid_orders_5: float = 0.0
+    
     ask_price_1: float = 0.0
     ask_qty_1: float = 0.0
     ask_orders_1: float = 0.0
@@ -57,28 +63,11 @@ class MarketDataMessage:
     ask_price_5: float = 0.0
     ask_qty_5: float = 0.0
     ask_orders_5: float = 0.0
+    
     message_type: int = 1  # 1=LTP, 2=Quote, 3=Depth
-
-    # Format:
-    # <32s (symbol)
-    # d (timestamp)
-    # d (price)
-    # d (volume)
-    # d (bid)
-    # d (ask)
-    # d (bid_qty)
-    # d (ask_qty)
-    # d (open)
-    # d (high)
-    # d (low)
-    # d (close)
-    # d (average_price)
-    # d (percent_change)
-    # d (last_quantity)
-    # B (type)
-    # Increased symbol field to 32 bytes to support longer symbols (e.g., MCX contracts)
-    # Add 2 totals and 30 depth doubles (5 levels x 3 metrics x 2 sides)
-    _STRUCT_FORMAT = "<32s" + ("d" * (14 + 2 + 30)) + "B"
+    
+    # Binary format for maximum speed - UPDATED to include exchange field
+    _STRUCT_FORMAT = "<32s32s" + ("d" * (14 + 2 + 30)) + "B"
     _STRUCT_SIZE = struct.calcsize(_STRUCT_FORMAT)
     
     @classmethod
@@ -88,34 +77,25 @@ class MarketDataMessage:
     
     def to_bytes(self) -> bytes:
         """Serialize message to bytes for shared memory."""
-        # Ensure symbol is exactly 32 bytes, truncate or pad with nulls
         symbol_bytes = self.symbol.encode('ascii')[:32].ljust(32, b'\x00')
+        exchange_bytes = self.exchange.encode('ascii')[:32].ljust(32, b'\x00')  # ADD THIS
+        
         return struct.pack(
             self._STRUCT_FORMAT,
             symbol_bytes,
-            self.timestamp,
-            self.price,
-            self.volume,
-            self.bid_price,
-            self.ask_price,
-            self.bid_quantity,
-            self.ask_quantity,
-            self.open_price,
-            self.high_price,
-            self.low_price,
-            self.close_price,
-            self.average_price,
-            self.percent_change,
-            self.last_quantity,
-            self.total_buy_quantity,
-            self.total_sell_quantity,
+            exchange_bytes,  # ADD THIS
+            self.timestamp, self.price, self.volume,
+            self.bid_price, self.ask_price, self.bid_quantity, self.ask_quantity,
+            self.open_price, self.high_price, self.low_price, self.close_price,
+            self.average_price, self.percent_change, self.last_quantity,
+            self.total_buy_quantity, self.total_sell_quantity,
             # Bid depth
             self.bid_price_1, self.bid_qty_1, self.bid_orders_1,
             self.bid_price_2, self.bid_qty_2, self.bid_orders_2,
             self.bid_price_3, self.bid_qty_3, self.bid_orders_3,
             self.bid_price_4, self.bid_qty_4, self.bid_orders_4,
             self.bid_price_5, self.bid_qty_5, self.bid_orders_5,
-            # Ask depth
+            # Ask depth  
             self.ask_price_1, self.ask_qty_1, self.ask_orders_1,
             self.ask_price_2, self.ask_qty_2, self.ask_orders_2,
             self.ask_price_3, self.ask_qty_3, self.ask_orders_3,
@@ -129,58 +109,25 @@ class MarketDataMessage:
         """Deserialize message from bytes."""
         try:
             unpacked = struct.unpack(cls._STRUCT_FORMAT, data[:cls._STRUCT_SIZE])
-            (
-                symbol_bytes,
-                timestamp,
-                price,
-                volume,
-                bid_price,
-                ask_price,
-                bid_quantity,
-                ask_quantity,
-                open_price,
-                high_price,
-                low_price,
-                close_price,
-                average_price,
-                percent_change,
-                last_quantity,
-                total_buy_quantity,
-                total_sell_quantity,
-                bp1, bq1, bo1,
-                bp2, bq2, bo2,
-                bp3, bq3, bo3,
-                bp4, bq4, bo4,
-                bp5, bq5, bo5,
-                ap1, aq1, ao1,
-                ap2, aq2, ao2,
-                ap3, aq3, ao3,
-                ap4, aq4, ao4,
-                ap5, aq5, ao5,
-                message_type
-            ) = unpacked
             
-            # Convert symbol from bytes to str, removing null bytes
+            (symbol_bytes, exchange_bytes, timestamp, price, volume, bid_price, ask_price, 
+             bid_quantity, ask_quantity, open_price, high_price, low_price, 
+             close_price, average_price, percent_change, last_quantity,
+             total_buy_quantity, total_sell_quantity,
+             bp1, bq1, bo1, bp2, bq2, bo2, bp3, bq3, bo3, bp4, bq4, bo4, bp5, bq5, bo5,
+             ap1, aq1, ao1, ap2, aq2, ao2, ap3, aq3, ao3, ap4, aq4, ao4, ap5, aq5, ao5,
+             message_type) = unpacked
+            
             symbol = symbol_bytes.decode('ascii').rstrip('\x00')
+            exchange = exchange_bytes.decode('ascii').rstrip('\x00')  # ADD THIS
             
             return cls(
-                symbol=symbol,
-                timestamp=timestamp,
-                price=price,
-                volume=volume,
-                bid_price=bid_price,
-                ask_price=ask_price,
-                bid_quantity=bid_quantity,
-                ask_quantity=ask_quantity,
-                open_price=open_price,
-                high_price=high_price,
-                low_price=low_price,
-                close_price=close_price,
-                average_price=average_price,
-                percent_change=percent_change,
-                last_quantity=last_quantity,
-                total_buy_quantity=total_buy_quantity,
-                total_sell_quantity=total_sell_quantity,
+                symbol=symbol, exchange=exchange, timestamp=timestamp, price=price, volume=volume,  # ADD exchange
+                bid_price=bid_price, ask_price=ask_price, bid_quantity=bid_quantity,
+                ask_quantity=ask_quantity, open_price=open_price, high_price=high_price,
+                low_price=low_price, close_price=close_price, average_price=average_price,
+                percent_change=percent_change, last_quantity=last_quantity,
+                total_buy_quantity=total_buy_quantity, total_sell_quantity=total_sell_quantity,
                 bid_price_1=bp1, bid_qty_1=bq1, bid_orders_1=bo1,
                 bid_price_2=bp2, bid_qty_2=bq2, bid_orders_2=bo2,
                 bid_price_3=bp3, bid_qty_3=bq3, bid_orders_3=bo3,
@@ -200,6 +147,7 @@ class MarketDataMessage:
         """Convert message to dictionary for JSON serialization."""
         base = {
             'symbol': self.symbol,
+            'exchange': self.exchange,  # ADD THIS LINE
             'timestamp': self.timestamp,
             'price': self.price,
             'volume': self.volume,
@@ -219,6 +167,7 @@ class MarketDataMessage:
             'type': self.get_message_type_str(),
             'time': datetime.fromtimestamp(self.timestamp).isoformat()
         }
+        
         # Include depth for DEPTH messages or when depth levels are populated
         depth_buy = [
             {'price': self.bid_price_1, 'quantity': self.bid_qty_1, 'orders': self.bid_orders_1},
@@ -227,6 +176,7 @@ class MarketDataMessage:
             {'price': self.bid_price_4, 'quantity': self.bid_qty_4, 'orders': self.bid_orders_4},
             {'price': self.bid_price_5, 'quantity': self.bid_qty_5, 'orders': self.bid_orders_5},
         ]
+        
         depth_sell = [
             {'price': self.ask_price_1, 'quantity': self.ask_qty_1, 'orders': self.ask_orders_1},
             {'price': self.ask_price_2, 'quantity': self.ask_qty_2, 'orders': self.ask_orders_2},
@@ -234,12 +184,15 @@ class MarketDataMessage:
             {'price': self.ask_price_4, 'quantity': self.ask_qty_4, 'orders': self.ask_orders_4},
             {'price': self.ask_price_5, 'quantity': self.ask_qty_5, 'orders': self.ask_orders_5},
         ]
-        # Determine if any depth values are non-zero
-        if any(level['price'] or level['quantity'] or level['orders'] for level in depth_buy + depth_sell):
+        
+        # Add depth if any values are non-zero
+        if any(level['price'] or level['quantity'] or level['orders'] 
+               for level in depth_buy + depth_sell):
             base['depth'] = {
                 'buy': depth_buy,
                 'sell': depth_sell,
             }
+        
         return base
     
     def to_json(self) -> str:
@@ -248,8 +201,4 @@ class MarketDataMessage:
     
     def get_message_type_str(self) -> str:
         """Get message type as string."""
-        return {
-            1: 'LTP',
-            2: 'QUOTE',
-            3: 'DEPTH'
-        }.get(self.message_type, 'UNKNOWN')
+        return {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}.get(self.message_type, 'UNKNOWN')
