@@ -35,7 +35,15 @@ class Config:
     # # Broker settings
     # ENABLE_FLATTRADE: bool = os.getenv("ENABLE_FLATTRADE", "true").lower() == "true"
     # FLATTRADE_USER_ID: str = os.getenv("FLATTRADE_USER_ID", "root")
-    
+
+    # Ultra-high-performance settings for trading
+    DIRECT_DELIVERY_MODE = True  # CRITICAL: Enable direct delivery
+    RING_BUFFER_BATCH_SIZE = 50  # Process 50 messages per batch
+    PROCESSING_POLL_INTERVAL_MS = 0.1  # 0.1ms polling interval
+    MAX_QUEUE_SIZE = 100  # Limit fallback queue size
+    WS_MAX_MESSAGE_SIZE = 65536  # 64KB messages
+    WS_COMPRESSION = None  # Disable compression for speed
+
     @classmethod
     def to_dict(cls) -> Dict[str, Any]:
         """Convert config to dictionary for logging/display."""
