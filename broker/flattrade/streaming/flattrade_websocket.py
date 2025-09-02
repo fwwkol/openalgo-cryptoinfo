@@ -16,7 +16,7 @@ class FlattradeWebSocket:
     # Connection constants
     WS_URL = "wss://piconnect.flattrade.in/PiConnectWSTp/"
     CONNECTION_TIMEOUT = 15
-    THREAD_JOIN_TIMEOUT = 5
+    THREAD_JOIN_TIMEOUT = 10  # Increased timeout
     
     # Heartbeat constants
     HEARTBEAT_INTERVAL = 30
@@ -63,6 +63,7 @@ class FlattradeWebSocket:
         self.ws_thread = None
         self.running = False
         self.connected = False
+        self._shutdown_event = threading.Event()  # Added for graceful shutdown
         
         # Callbacks
         self.on_message = on_message
@@ -100,6 +101,7 @@ class FlattradeWebSocket:
     def _initialize_connection(self) -> None:
         """Initialize WebSocket connection and start thread"""
         self.running = True
+        self._shutdown_event.clear()  # Reset shutdown event
         
         self.ws = websocket.WebSocketApp(
             self.WS_URL,
@@ -150,29 +152,77 @@ class FlattradeWebSocket:
 
     def stop(self) -> None:
         """Stop the WebSocket connection and cleanup resources"""
+        if not self.running:
+            self.logger.debug("WebSocket already stopped or stopping")
+            return
+            
         self.logger.info("Stopping WebSocket connection")
         
+        # Set flags to stop all operations
         self.running = False
         self.connected = False
+        self._shutdown_event.set()  # Signal shutdown to all threads
         
-        self._close_websocket()
-        self._wait_for_thread_completion()
+        # Stop heartbeat first (it's usually quicker)
         self._stop_heartbeat()
+        
+        # Close WebSocket connection
+        self._close_websocket()
+        
+        # Wait for thread completion with better handling
+        self._wait_for_thread_completion()
 
     def _close_websocket(self) -> None:
-        """Close WebSocket connection"""
+        """Close WebSocket connection with better error handling"""
         if self.ws:
             try:
+                # First try to close gracefully
                 self.ws.close()
+                
+                # Give it a moment to close gracefully
+                time.sleep(0.1)
+                
+                # If still connected, try to force close
+                if hasattr(self.ws, 'sock') and self.ws.sock:
+                    try:
+                        self.ws.sock.close()
+                    except:
+                        pass  # Ignore errors during force close
+                        
             except Exception as e:
                 self.logger.error(f"Error closing WebSocket: {e}")
 
     def _wait_for_thread_completion(self) -> None:
-        """Wait for WebSocket thread to complete"""
-        if self.ws_thread and self.ws_thread.is_alive():
-            self.ws_thread.join(timeout=self.THREAD_JOIN_TIMEOUT)
+        """Wait for WebSocket thread to complete with better handling"""
+        if not self.ws_thread or not self.ws_thread.is_alive():
+            return
+            
+        # Wait for thread to finish
+        self.ws_thread.join(timeout=self.THREAD_JOIN_TIMEOUT)
+        
+        if self.ws_thread.is_alive():
+            # Thread is still alive - this might happen if the websocket is stuck
+            self.logger.warning(
+                f"WebSocket thread did not terminate within {self.THREAD_JOIN_TIMEOUT}s timeout. "
+                "This may indicate a network connectivity issue or the server is not responding to close requests."
+            )
+            
+            # Additional cleanup attempt
+            if self.ws and hasattr(self.ws, 'sock') and self.ws.sock:
+                try:
+                    self.ws.sock.settimeout(1.0)  # Set short timeout
+                    self.ws.sock.close()
+                except:
+                    pass
+                    
+            # Give it one more short chance
+            self.ws_thread.join(timeout=2.0)
+            
             if self.ws_thread.is_alive():
-                self.logger.warning("WebSocket thread did not terminate within timeout")
+                self.logger.info(
+                    "WebSocket thread is still running but will be cleaned up by daemon thread cleanup. "
+                    "This is typically harmless."
+                )
 
     # WebSocket Event Handlers
     def _on_open(self, ws) -> None:
@@ -305,17 +355,21 @@ class FlattradeWebSocket:
 
     def _stop_heartbeat(self) -> None:
         """Stop heartbeat monitoring thread"""
-        # Thread will stop when self.running becomes False
+        # Thread will stop when self.running becomes False or shutdown event is set
         if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self.logger.debug("Waiting for heartbeat thread to stop")
+            self.logger.debug("Signaling heartbeat thread to stop")
+            # The shutdown event and running flag will cause it to exit
 
     def _heartbeat_worker(self) -> None:
         """Heartbeat worker thread - sends periodic heartbeats and monitors connection"""
-        while self.running and self.connected:
+        while self.running and self.connected and not self._shutdown_event.is_set():
             try:
-                time.sleep(self.HEARTBEAT_INTERVAL)
+                # Use shutdown event for interruptible sleep
+                if self._shutdown_event.wait(timeout=self.HEARTBEAT_INTERVAL):
+                    # Shutdown was signaled
+                    break
                 
-                if self.running and self.connected:
+                if self.running and self.connected and not self._shutdown_event.is_set():
                     if not self._send_heartbeat():
                         break
                     
@@ -325,6 +379,8 @@ class FlattradeWebSocket:
             except Exception as e:
                 self.logger.error(f"Heartbeat worker error: {e}")
                 break
+        
+        self.logger.debug("Heartbeat thread exiting")
 
     def _send_heartbeat(self) -> bool:
         """
@@ -333,7 +389,7 @@ class FlattradeWebSocket:
         Returns:
             bool: True if heartbeat sent successfully, False otherwise
         """
-        if not self.ws:
+        if not self.ws or self._shutdown_event.is_set():
             return False
         
         try:
@@ -510,5 +566,6 @@ class FlattradeWebSocket:
             'ws_url': self.WS_URL,
             'last_message_time': self._last_message_time,
             'heartbeat_thread_alive': self._heartbeat_thread.is_alive() if self._heartbeat_thread else False,
-            'ws_thread_alive': self.ws_thread.is_alive() if self.ws_thread else False
+            'ws_thread_alive': self.ws_thread.is_alive() if self.ws_thread else False,
+            'shutdown_event_set': self._shutdown_event.is_set()
         }
