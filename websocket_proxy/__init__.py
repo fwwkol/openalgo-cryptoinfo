@@ -39,6 +39,13 @@ try:
 except ImportError as e:
     logger.debug(f"Angel SHM adapter not available: {e}")
 
+try:
+    from broker.shoonya.streaming.shoonya_adapter_shm import ShoonyaSHMWebSocketAdapter
+    register_adapter("shoonya", ShoonyaSHMWebSocketAdapter)
+    logger.debug("Shoonya SHM adapter registered")
+except ImportError as e:
+    logger.debug(f"Shoonya SHM adapter not available: {e}")
+
 # Add more SHM adapters here as they are created
 # try:
 #     from broker.zerodha.streaming.zerodha_adapter_shm import ZerodhaSHMWebSocketAdapter
