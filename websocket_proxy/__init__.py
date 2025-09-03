@@ -32,12 +32,12 @@ def _register_flattrade_adapter():
 _flattrade_registered = False
 
 # Register other SHM adapters as they become available
-# try:
-#     from broker.angel.streaming.angel_adapter_shm import AngelSHMWebSocketAdapter
-#     register_adapter("angel", AngelSHMWebSocketAdapter)
-#     logger.debug("Angel SHM adapter registered")
-# except ImportError as e:
-#     logger.debug(f"Angel SHM adapter not available: {e}")
+try:
+    from broker.angel.streaming.angel_adapter_shm import AngelSHMWebSocketAdapter
+    register_adapter("angel", AngelSHMWebSocketAdapter)
+    logger.debug("Angel SHM adapter registered")
+except ImportError as e:
+    logger.debug(f"Angel SHM adapter not available: {e}")
 
 # Add more SHM adapters here as they are created
 # try:
