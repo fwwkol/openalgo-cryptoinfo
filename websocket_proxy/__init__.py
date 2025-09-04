@@ -46,6 +46,13 @@ try:
 except ImportError as e:
     logger.debug(f"Shoonya SHM adapter not available: {e}")
 
+try:
+    from broker.kotak.streaming.kotak_adapter_shm import KotakSHMWebSocketAdapter
+    register_adapter("kotak", KotakSHMWebSocketAdapter)
+    logger.debug("Kotak SHM adapter registered")
+except ImportError as e:
+    logger.debug(f"Kotak SHM adapter not available: {e}")
+
 # Add more SHM adapters here as they are created
 # try:
 #     from broker.zerodha.streaming.zerodha_adapter_shm import ZerodhaSHMWebSocketAdapter

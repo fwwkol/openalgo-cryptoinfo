@@ -1,29 +1,116 @@
 """
-High-level, AliceBlue-style adapter for Kotak broker WebSocket streaming.
+Kotak SHM WebSocket Adapter - Ported to use shared memory ring buffer
+Publishes market data directly to the Shared Memory ring buffer with preserved OHLC data.
 Each instance is fully isolated and safe for multi-client use.
 """
 import threading
 import time
 import sys
 import os
+import json
+import logging
+from typing import Dict, Any, Optional, List
 
 # Add parent directory to path to allow imports
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../'))
 
-from websocket_proxy_old.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy.optimized_ring_buffer import OptimizedRingBuffer
+from websocket_proxy.mapping import SymbolMapper
+from websocket_proxy.binary_market_data import BinaryMarketData
+from websocket_proxy.market_data import MarketDataMessage
 from .kotak_websocket import KotakWebSocket
 from database.auth_db import get_auth_token
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
+
+class Config:
+    MODE_LTP = 1
+    MODE_QUOTE = 2
+    MODE_DEPTH = 3
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    """Safely convert value to float with default fallback."""
+    if value is None or value == '' or value == '-' or value == 21474836.48:  # Kotak's invalid value
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    """Safely convert value to int with default fallback."""
+    if value is None or value == '' or value == '-' or value == 2147483648:  # Kotak's invalid volume
+        return default
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        return default
+
+
+class MarketDataCache:
+    """Enhanced market data cache with state merging for partial updates."""
+    
+    def __init__(self):
+        self._cache = {}
+        self._initialized_tokens = set()
+        self._lock = threading.Lock()
+        self.logger = logging.getLogger("kotak_market_cache")
+
+    def update(self, token: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Update cache with partial data merging logic."""
+        with self._lock:
+            cached_data = self._cache.get(token, {})
+            merged = cached_data.copy()
+            
+            # Merge new data, preserving existing values for invalid updates
+            for key, value in data.items():
+                if key in ['open', 'high', 'low', 'prev_close', 'bid', 'ask', 'ltp']:
+                    # Only update price fields if value is valid
+                    if value and float(value) > 0 and float(value) != 21474836.48:
+                        merged[key] = value
+                elif key == 'volume':
+                    # Only update volume if valid
+                    if value and float(value) > 0 and float(value) != 2147483648:
+                        merged[key] = value
+                elif key == 'ts':
+                    # Only update symbol name if non-empty
+                    if value:
+                        merged[key] = value
+                elif value not in [None, '', '-', 0.0]:
+                    merged[key] = value
+            
+            # Preserve missing fields from cache
+            for k, v in cached_data.items():
+                if k not in merged and v not in [None, '', '-', 0.0]:
+                    merged[k] = v
+            
+            self._cache[token] = merged
+            return merged.copy()
+
+    def get(self, token: str) -> Dict[str, Any]:
+        """Get cached data for token."""
+        with self._lock:
+            return self._cache.get(token, {}).copy()
+
+    def clear_token(self, token: str):
+        """Clear cache for specific token."""
+        with self._lock:
+            self._cache.pop(token, None)
+
+
+class KotakSHMWebSocketAdapter:
     """
-    Adapter for Kotak WebSocket streaming, suitable for OpenAlgo or similar frameworks.
+    Kotak SHM adapter that publishes to SHM ring buffer with full OHLC support.
+    Maintains all original Kotak adapter functions while using SHM for data publishing.
     Each instance is isolated and manages its own KotakWebSocket client.
     """
-    def __init__(self):
-        super().__init__()  # ← Initialize base adapter (sets up ZMQ)
+    
+    def __init__(self, shm_buffer_name: str = None):
+        self.logger = logging.getLogger("kotak_adapter_shm")
         self._ws_client = None
         self._user_id = None
         self._broker_name = "kotak"
@@ -31,7 +118,10 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self._connected = False
         self._lock = threading.RLock()
         
-        # Cache structures - following AliceBlue pattern exactly
+        # Market data cache for state management
+        self.market_cache = MarketDataCache()
+        
+        # Cache structures - following original Kotak pattern exactly
         self._ltp_cache = {}  # {(exchange, symbol): ltp_value}
         self._quote_cache = {}  # {(exchange, symbol): full_quote_dict}
         self._depth_cache = {}  # {(exchange, symbol): depth_dict}
@@ -42,9 +132,24 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         
         # Track active subscription modes per symbol - CRITICAL FOR MULTI-CLIENT SUPPORT
         self._symbol_modes = {}  # {(kotak_exchange, token): set of active modes}
+        
+        # Subscription tracking
+        self.subscriptions: Dict[str, Dict[str, Any]] = {}
+        self.token_to_symbol: Dict[str, tuple] = {}
+        self.running = False
+        self.reconnect_attempts = 0
+        
+        # SHM ring buffer initialization
+        buffer_name = shm_buffer_name or os.getenv('SHM_BUFFER_NAME', 'ws_proxy_buffer')
+        try:
+            self.ring_buffer = OptimizedRingBuffer(name=buffer_name, create=False)
+            self.logger.info(f"OptimizedRingBuffer initialized with buffer '{buffer_name}'")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize OptimizedRingBuffer: {e}")
+            self.ring_buffer = None
 
     def initialize(self, broker_name: str, user_id: str, auth_data=None):
-        """Initialize adapter for a specific user/session - following AliceBlue pattern."""
+        """Initialize adapter for a specific user/session - following original Kotak pattern."""
         self._broker_name = broker_name.lower()
         self._user_id = user_id
         
@@ -64,18 +169,18 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Create websocket client
         self._ws_client = KotakWebSocket(self._auth_config)
         
-        # Set up internal callbacks - this MUST happen during initialization like AliceBlue
+        # Set up internal callbacks - this MUST happen during initialization
         self._setup_internal_callbacks()
         
-        logger.debug(f"Initialized KotakWebSocketAdapter for user {user_id}")
+        self.running = True
+        logger.debug(f"Initialized KotakSHMWebSocketAdapter for user {user_id}")
 
     def _setup_internal_callbacks(self):
-        """Setup internal callbacks - following AliceBlue's _on_data_received pattern."""
+        """Setup internal callbacks - following original Kotak pattern."""
         def on_quote_internal(quote):
-            """Internal callback - mirrors AliceBlue's _on_data_received method."""
+            """Internal callback - mirrors original Kotak's _on_data_received method."""
             try:
                 logger.debug(f"Internal quote callback received: {quote}")
-                # Use the same pattern as AliceBlue's _on_data_received
                 self._on_data_received(quote)
             except Exception as e:
                 logger.error(f"Error in internal quote handler: {e}")
@@ -97,7 +202,10 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
             )
 
     def _on_data_received(self, parsed_data):
-        """Handle received and parsed market data - FIXED for partial updates like AliceBlue."""
+        """
+        Handle received and parsed market data - Enhanced for SHM publishing.
+        FIXED for partial updates like original Kotak adapter.
+        """
         try:
             logger.debug(f"Data received: {parsed_data}")
 
@@ -107,7 +215,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self._on_data_received(item)
                 return
             
-            # Extract key identifiers - following AliceBlue pattern
+            # Extract key identifiers - following original Kotak pattern
             token = str(parsed_data.get('tk', ''))
             broker_exchange = parsed_data.get('e', 'UNKNOWN')
             ltp = parsed_data.get('ltp')
@@ -116,8 +224,12 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
             has_depth_data = 'bids' in parsed_data and 'asks' in parsed_data
             has_ltp_data = ltp and float(ltp) > 0
             
-            # Create symbol key - following AliceBlue pattern
+            # Create symbol key - following original Kotak pattern
             symbol_key = f"{broker_exchange}|{token}"
+            
+            # Update market cache with partial merge logic
+            if token:
+                parsed_data = self.market_cache.update(token, parsed_data)
             
             with self._lock:
                 # Check if this is a partial update by detecting missing expected fields
@@ -206,7 +318,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     parsed_data['bids'] = merged_bids
                     parsed_data['asks'] = merged_asks
 
-                # **CRITICAL FIX FOR PARTIAL UPDATES**: Implement AliceBlue-style state merging
+                # **CRITICAL FIX FOR PARTIAL UPDATES**: Implement state merging
                 if is_partial_update and symbol_key in self._symbol_state:
                     logger.debug(f"Partial update detected for {symbol_key}")
                     merged_data = self._symbol_state[symbol_key].copy()
@@ -236,7 +348,6 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     has_ltp_data = ltp and float(ltp) > 0
 
                 # Store the complete data (either original complete data or merged data)
-                # --- CRITICAL: Store per-symbol state, including merged bids/asks for this symbol only ---
                 self._symbol_state[symbol_key] = {
                     **parsed_data,
                     'bids': parsed_data.get('bids', []),
@@ -276,44 +387,8 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     active_modes = self._symbol_modes.get(mapping_key, set())
                     
                     for mode in active_modes:
-                        mode_map = {1: 'LTP', 2: 'QUOTE', 3: 'DEPTH'}
-                        mode_str = mode_map.get(mode, 'LTP')
-                        topic = f"{exchange}_{symbol}_{mode_str}"
-                        if mode == 1 and has_ltp_data:
-                            publish_data = {
-                                'ltp': float(ltp),
-                                'ltt': parsed_data.get('timestamp', int(time.time() * 1000))
-                            }
-                        elif mode == 2:
-                            publish_data = {
-                                'ltp': float(ltp) if has_ltp_data else 0.0,
-                                'ltt': parsed_data.get('timestamp', int(time.time() * 1000)),
-                                'volume': parsed_data.get('volume', 0),
-                                'open': parsed_data.get('open', 0.0),
-                                'high': parsed_data.get('high', 0.0),
-                                'low': parsed_data.get('low', 0.0),
-                                'close': parsed_data.get('prev_close', 0.0)
-                            }
-                        elif mode == 3 and has_depth_data:
-                            publish_data = {
-                                'ltp': float(ltp) if has_ltp_data else 0.0,
-                                'timestamp': int(time.time() * 1000),
-                                'depth': {
-                                    'buy': parsed_data.get('bids', []),
-                                    'sell': parsed_data.get('asks', [])
-                                },
-                                'totalbuyqty': parsed_data.get('totalbuyqty', 0),
-                                'totalsellqty': parsed_data.get('totalsellqty', 0)
-                            }
-                        else:
-                            continue
-                        publish_data.update({
-                            'symbol': symbol,
-                            'exchange': exchange,
-                            'timestamp': int(time.time() * 1000)
-                        })
-                        logger.debug(f"Publishing to ZMQ topic: {topic}")
-                        self.publish_market_data(topic, publish_data)
+                        # Publish to SHM using the same pattern as Flattrade
+                        self._publish_subscription_message(parsed_data, symbol, exchange, mode)
                     
                     if has_ltp_data:
                         logger.debug(f"Updated LTP cache: {exchange}:{symbol} = {ltp}")
@@ -324,7 +399,120 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         except Exception as e:
             logger.error(f"Error processing received data: {e}")
 
+    def _publish_subscription_message(self, data: Dict[str, Any], symbol: str, exchange: str, mode: int) -> None:
+        """Publish market data to SHM using the Flattrade pattern."""
+        try:
+            normalized = self._normalize_market_data(data, mode)
+            normalized.update({
+                'symbol': symbol, 
+                'exchange': exchange, 
+                'timestamp': int(time.time() * 1000)
+            })
             
+            mode_map = {Config.MODE_LTP: 'LTP', Config.MODE_QUOTE: 'QUOTE', Config.MODE_DEPTH: 'DEPTH'}
+            topic = f"{exchange}_{symbol}_{mode_map.get(mode, 'LTP')}"
+            
+            logger.debug(f"[APP->SHM] topic={topic} symbol={symbol} payload={json.dumps(normalized)[:200]}...")
+            self._publish_market_data(topic, normalized)
+            
+        except Exception as e:
+            logger.error(f"Error publishing subscription message: {e}")
+
+    def _normalize_market_data(self, data: Dict[str, Any], mode: int) -> Dict[str, Any]:
+        """Normalize Kotak data format for SHM publishing - following Flattrade pattern."""
+        if mode == Config.MODE_LTP:
+            return {
+                'mode': Config.MODE_LTP,
+                'ltp': safe_float(data.get('ltp')),
+                'ltt': data.get('timestamp', int(time.time() * 1000))
+            }
+        
+        if mode == Config.MODE_QUOTE:
+            return {
+                'mode': Config.MODE_QUOTE,
+                'ltp': safe_float(data.get('ltp')),
+                'volume': safe_int(data.get('volume')),
+                'open': safe_float(data.get('open')),
+                'high': safe_float(data.get('high')),
+                'low': safe_float(data.get('low')),
+                'close': safe_float(data.get('prev_close')),
+                'ltt': data.get('timestamp', int(time.time() * 1000))
+            }
+        
+        # DEPTH mode with enhanced depth data
+        result = {
+            'mode': Config.MODE_DEPTH,
+            'ltp': safe_float(data.get('ltp')),
+            'volume': safe_int(data.get('volume')),
+            'open': safe_float(data.get('open')),
+            'high': safe_float(data.get('high')),
+            'low': safe_float(data.get('low')),
+            'close': safe_float(data.get('prev_close')),
+            'timestamp': int(time.time() * 1000),
+            'totalbuyqty': safe_int(data.get('totalbuyqty', 0)),
+            'totalsellqty': safe_int(data.get('totalsellqty', 0))
+        }
+        
+        # Enhanced depth data
+        result['depth'] = {
+            'buy': data.get('bids', []),
+            'sell': data.get('asks', [])
+        }
+        
+        return result
+
+    def _publish_market_data(self, topic: str, data: Dict[str, Any]) -> None:
+        """
+        Enhanced publish method that preserves OHLC data using the new binary format.
+        """
+        if self.ring_buffer is None:
+            self.logger.debug("Ring buffer not available; drop message")
+            return
+        
+        try:
+            symbol = data.get('symbol', '')
+            exchange = data.get('exchange', 'NSE')
+            mode = data.get('mode', 1)
+            
+            # For depth data (mode 3), preserve full depth structure by using dict format
+            if mode == Config.MODE_DEPTH:
+                ltp_value = data.get('ltp', 0) or data.get('price', 0)
+                price_float = float(ltp_value) if ltp_value else 0.0
+                
+                self.logger.debug(f"Price conversion - ltp_value: {ltp_value}, price_float: {price_float}")
+                
+                enriched_data = data.copy()
+                enriched_data.update({
+                    'price': price_float,
+                    'ltp': price_float,
+                })
+                
+                self.logger.debug(f"Depth data preserved - symbol: {symbol}, depth levels: {len(data.get('depth', {}).get('buy', []))}")
+                
+                published = self.ring_buffer.publish_single(enriched_data)
+                if not published:
+                    self.logger.debug(f"[APP->SHM] publish failed for symbol={symbol} (buffer full)")
+                else:
+                    self.logger.debug(f"[APP->SHM] published depth data for symbol={symbol}")
+            else:
+                # For LTP/Quote modes, use the new enhanced binary format that preserves OHLC
+                self.logger.debug(f"Publishing OHLC data for {symbol}: O={data.get('open', 0)}, H={data.get('high', 0)}, L={data.get('low', 0)}, C={data.get('close', 0)}")
+                
+                # Create binary message using the new from_normalized_data method
+                binary_msg = BinaryMarketData.from_normalized_data(data, exchange)
+                
+                self.logger.debug(f"Binary message created - price: {binary_msg.get_price_float()}, symbol: {binary_msg.get_symbol_string()}, open: {binary_msg.get_open_price_float()}")
+                
+                published = self.ring_buffer.publish_single(binary_msg)
+                if not published:
+                    self.logger.debug(f"[APP->SHM] publish failed for symbol={symbol} (buffer full)")
+                else:
+                    self.logger.debug(f"[APP->SHM] published symbol={symbol}")
+                
+        except Exception as e:
+            self.logger.error(f"Error publishing market data for {topic}: {e}")
+            self.logger.debug(f"Failed data: {data}")
+
     def _is_partial_update(self, parsed_data):
         """
         Determine if this is a partial update based on missing expected fields.
@@ -347,9 +535,8 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         
         return False  # Default to processing the update
 
-
     def connect(self):
-        """Connect to WebSocket - following AliceBlue pattern."""
+        """Connect to WebSocket - following original Kotak pattern."""
         if not self._ws_client:
             logger.error("WebSocket client not initialized. Call initialize() first.")
             return
@@ -357,20 +544,21 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         try:
             self._ws_client.connect()
             self._connected = True
+            self.connected = True
             logger.debug("Kotak WebSocket connected successfully")
         except Exception as e:
             logger.error(f"Error connecting to Kotak WebSocket: {e}")
             self._connected = False
+            self.connected = False
 
     def disconnect(self):
         """Disconnect from WebSocket."""
         try:
+            self.running = False
             if self._ws_client:
                 self._ws_client.close()
             self._connected = False
-            
-            # Clean up ZeroMQ resources - CRITICAL for multi-instance support
-            self.cleanup_zmq()
+            self.connected = False
             
             logger.debug("Kotak WebSocket disconnected")
         except Exception as e:
@@ -385,10 +573,10 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         try:
             logger.debug(f"Subscribing to {exchange}:{symbol} with mode {mode}")
             
-            if mode in (1, 2):
+            if mode in (Config.MODE_LTP, Config.MODE_QUOTE):
                 # Quote/LTP subscription
                 success = self.subscribe_quote(exchange, symbol, mode)
-            elif mode == 3:
+            elif mode == Config.MODE_DEPTH:
                 # Depth subscription
                 success = self.subscribe_depth(exchange, symbol, mode)
             else:
@@ -396,8 +584,10 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 return self._create_error_response("INVALID_MODE", f"Unknown subscribe mode: {mode}")
             
             if success:
-                # Track subscription - following AliceBlue pattern with detailed tracking
+                # Track subscription - following original Kotak pattern with detailed tracking
                 sub_key = f"{exchange}|{symbol}|{mode}"
+                correlation_id = f"{symbol}_{exchange}_{mode}"
+                
                 with self._lock:
                     self.subscriptions[sub_key] = {
                         'symbol': symbol,
@@ -405,6 +595,19 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         'mode': mode,
                         'depth_level': depth_level
                     }
+                    # Also track in Flattrade pattern
+                    token_info = SymbolMapper.get_token_from_symbol(symbol, exchange)
+                    if token_info:
+                        token = token_info['token']
+                        self.token_to_symbol[token] = (symbol, exchange)
+                        self.subscriptions[correlation_id] = {
+                            'symbol': symbol,
+                            'exchange': exchange,
+                            'mode': mode,
+                            'depth_level': depth_level,
+                            'token': token
+                        }
+                
                 return self._create_success_response(f"Subscribed to {exchange}:{symbol} mode {mode}")
             else:
                 return self._create_error_response("SUBSCRIPTION_FAILED", f"Failed to subscribe to {exchange}:{symbol}")
@@ -422,15 +625,18 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         try:
             logger.debug(f"Unsubscribing from {exchange}:{symbol} with mode {mode}")
             
-            if mode in (1, 2):
+            if mode in (Config.MODE_LTP, Config.MODE_QUOTE):
                 self.unsubscribe_quote(exchange, symbol, mode)
-            elif mode == 3:
+            elif mode == Config.MODE_DEPTH:
                 self.unsubscribe_depth(exchange, symbol, mode)
             
-            # Clean up tracking and cache - following AliceBlue pattern
+            # Clean up tracking and cache - following original Kotak pattern
             sub_key = f"{exchange}|{symbol}|{mode}"
+            correlation_id = f"{symbol}_{exchange}_{mode}"
+            
             with self._lock:
                 self.subscriptions.pop(sub_key, None)
+                self.subscriptions.pop(correlation_id, None)
                 
                 # Only clean up caches if NO modes are active for this symbol
                 from broker.kotak.streaming.kotak_mapping import get_kotak_exchange
@@ -447,6 +653,14 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         self._ltp_cache.pop(cache_key, None)
                         self._quote_cache.pop(cache_key, None)
                         self._depth_cache.pop(cache_key, None)
+                
+                # Clean up token mapping
+                token_info = SymbolMapper.get_token_from_symbol(symbol, exchange)
+                if token_info:
+                    token = token_info['token']
+                    if not any(sub.get('token') == token for sub in self.subscriptions.values()):
+                        self.token_to_symbol.pop(token, None)
+                        self.market_cache.clear_token(token)
                 
             return self._create_success_response(f"Unsubscribed from {exchange}:{symbol}")
             
@@ -521,7 +735,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self._symbol_modes[mapping_key].discard(mode)
                     
                     # Only unsubscribe from broker if no LTP/QUOTE modes are active
-                    ltp_quote_modes = {1, 2}
+                    ltp_quote_modes = {Config.MODE_LTP, Config.MODE_QUOTE}
                     active_ltp_quote_modes = self._symbol_modes[mapping_key] & ltp_quote_modes
                     
                     if not active_ltp_quote_modes:
@@ -599,7 +813,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self._symbol_modes[mapping_key].discard(mode)
                     
                     # Only unsubscribe from broker if no DEPTH modes are active
-                    if 3 not in self._symbol_modes[mapping_key]:
+                    if Config.MODE_DEPTH not in self._symbol_modes[mapping_key]:
                         # No more DEPTH modes active, unsubscribe from broker
                         self._ws_client.unsubscribe(kotak_exchange, token, sub_type="dpu")
                         logger.debug(f"Unsubscribed from broker depth: {exchange}:{symbol}")
@@ -616,7 +830,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
     def get_ltp(self):
         """Return LTP data in the format expected by the WebSocket server."""
         with self._lock:
-            # Create the expected nested format that matches AliceBlue/Angel response
+            # Create the expected nested format that matches original Kotak response
             ltp_dict = {}
             
             # Convert cache format to client-expected nested format
@@ -726,9 +940,141 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
         return self._ws_client.is_connected() if self._ws_client else False
 
     def set_callbacks(self, on_quote=None, on_depth=None, on_index=None, on_error=None, on_open=None, on_close=None):  
-        """Set additional user callbacks - following AliceBlue pattern."""
+        """Set additional user callbacks - following original Kotak pattern."""
         # Internal callbacks are already set up during initialization
         # This method is for additional user callbacks if needed
         logger.debug("set_callbacks called - internal callbacks remain active")
         # Don't override internal callbacks - they handle the cache updates
         pass
+
+    def _create_success_response(self, message: str) -> Dict[str, Any]:
+        """Create a success response."""
+        return {
+            "status": "success",
+            "message": message
+        }
+
+    def _create_error_response(self, code: str, message: str) -> Dict[str, Any]:
+        """Create an error response."""
+        return {
+            "status": "error",
+            "code": code,
+            "message": message
+        }
+
+    # Additional methods for compatibility with Flattrade SHM pattern
+    def _on_open(self, ws):
+        """WebSocket connection opened."""
+        self.logger.info("Connected to Kotak WebSocket")
+        self._connected = True
+        self.connected = True
+        self._resubscribe_all()
+
+    def _on_error(self, ws, error):
+        """WebSocket error occurred."""
+        self.logger.error(f"Kotak WebSocket error: {error}")
+
+    def _on_close(self, ws, code, msg):
+        """WebSocket connection closed."""
+        self.logger.info(f"Kotak WebSocket closed: {code} - {msg}")
+        self._connected = False
+        self.connected = False
+        if self.running:
+            self._schedule_reconnection()
+
+    def _resubscribe_all(self):
+        """Resubscribe to all active subscriptions after reconnection."""
+        with self._lock:
+            # Reset subscription references
+            self._symbol_modes = {}
+            
+            # Collect all active subscriptions
+            quote_subscriptions = []
+            depth_subscriptions = []
+            
+            for sub in self.subscriptions.values():
+                symbol = sub.get('symbol')
+                exchange = sub.get('exchange')
+                mode = sub.get('mode')
+                
+                if not all([symbol, exchange, mode]):
+                    continue
+                
+                try:
+                    from broker.kotak.streaming.kotak_mapping import get_kotak_exchange
+                    from database.token_db import get_token
+                    
+                    kotak_exchange = get_kotak_exchange(exchange)
+                    token = get_token(symbol, exchange)
+                    
+                    if not token:
+                        continue
+                    
+                    mapping_key = (kotak_exchange, str(token))
+                    self._kotak_to_openalgo[mapping_key] = (exchange, symbol)
+                    
+                    # Track active modes
+                    if mapping_key not in self._symbol_modes:
+                        self._symbol_modes[mapping_key] = set()
+                    self._symbol_modes[mapping_key].add(mode)
+                    
+                    # Collect subscriptions by type
+                    if mode in [Config.MODE_LTP, Config.MODE_QUOTE]:
+                        quote_subscriptions.append((kotak_exchange, token))
+                    elif mode == Config.MODE_DEPTH:
+                        depth_subscriptions.append((kotak_exchange, token))
+                        
+                except Exception as e:
+                    self.logger.error(f"Error preparing resubscription for {symbol}:{exchange}: {e}")
+            
+            # Resubscribe to quotes
+            for kotak_exchange, token in set(quote_subscriptions):
+                try:
+                    self._ws_client.subscribe(kotak_exchange, token, sub_type="mws")
+                    self.logger.debug(f"Resubscribed to quote: {kotak_exchange}|{token}")
+                except Exception as e:
+                    self.logger.error(f"Error resubscribing to quote {kotak_exchange}|{token}: {e}")
+            
+            # Resubscribe to depth
+            for kotak_exchange, token in set(depth_subscriptions):
+                try:
+                    self._ws_client.subscribe(kotak_exchange, token, sub_type="dps")
+                    self.logger.debug(f"Resubscribed to depth: {kotak_exchange}|{token}")
+                except Exception as e:
+                    self.logger.error(f"Error resubscribing to depth {kotak_exchange}|{token}: {e}")
+
+    def _schedule_reconnection(self):
+        """Schedule automatic reconnection with exponential backoff."""
+        if not self.running:
+            return
+            
+        delay = min(5 * (2 ** self.reconnect_attempts), 60)
+        self.reconnect_attempts += 1
+        self.logger.info(f"Scheduling reconnection attempt {self.reconnect_attempts} in {delay} seconds")
+        threading.Timer(delay, self._attempt_reconnection).start()
+
+    def _attempt_reconnection(self):
+        """Attempt to reconnect to WebSocket."""
+        if not self.running:
+            return
+            
+        try:
+            self.logger.info("Attempting to reconnect...")
+            
+            # Recreate WebSocket client
+            self._ws_client = KotakWebSocket(self._auth_config)
+            self._setup_internal_callbacks()
+            
+            # Attempt connection
+            if self._ws_client.connect():
+                self._connected = True
+                self.connected = True
+                self.reconnect_attempts = 0
+                self.logger.info("Reconnected successfully")
+            else:
+                raise ConnectionError("Failed to establish connection")
+                
+        except Exception as e:
+            self.logger.error(f"Reconnection attempt failed: {e}")
+            if self.running:
+                self._schedule_reconnection()
