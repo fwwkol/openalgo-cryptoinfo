@@ -73,6 +73,8 @@ class BinaryMarketData:
     EXCHANGE_BSE: ClassVar[int] = 2
     EXCHANGE_MCX: ClassVar[int] = 3
     EXCHANGE_NFO: ClassVar[int] = 4
+    EXCHANGE_NSE_INDEX: ClassVar[int] = 5  # Add this
+    EXCHANGE_BSE_INDEX: ClassVar[int] = 6  # Add this
     
     timestamp_ns: int
     symbol_hash: int
@@ -372,32 +374,31 @@ class BinaryMarketData:
     
     @staticmethod
     def _get_exchange_id(exchange: str) -> int:
-        """
-        Map exchange name to ID.
-        
-        Args:
-            exchange: Exchange name
-            
-        Returns:
-            int: Exchange ID
-        """
+        """Map exchange name to ID."""
         exchange_map = {
             'NSE': BinaryMarketData.EXCHANGE_NSE,
             'BSE': BinaryMarketData.EXCHANGE_BSE,
             'MCX': BinaryMarketData.EXCHANGE_MCX,
             'NFO': BinaryMarketData.EXCHANGE_NFO,
+            # Add index exchange mappings
+            'NSE_INDEX': 5,  # New exchange ID for NSE indices
+            'BSE_INDEX': 6,  # New exchange ID for BSE indices
         }
         return exchange_map.get(exchange.upper(), BinaryMarketData.EXCHANGE_NSE)
-    
+
     def _get_exchange_name(self) -> str:
         """Get exchange name from exchange ID."""
         exchange_map = {
             self.EXCHANGE_NSE: 'NSE',
-            self.EXCHANGE_BSE: 'BSE',
+            self.EXCHANGE_BSE: 'BSE', 
             self.EXCHANGE_MCX: 'MCX',
             self.EXCHANGE_NFO: 'NFO',
+            # Add reverse mappings for indices
+            5: 'NSE_INDEX',
+            6: 'BSE_INDEX',
         }
         return exchange_map.get(self.exchange_id, 'NSE')
+
     
     def get_symbol_string(self) -> str:
         """
@@ -492,7 +493,6 @@ class BinaryMarketData:
                 f"high={self.get_high_price_float():.4f}, low={self.get_low_price_float():.4f}, "
                 f"close={self.get_close_price_float():.4f}, volume={self.volume}, "
                 f"type={self.message_type}, timestamp={timestamp_sec:.6f})")
-
 
 def test_enhanced_binary_market_data():
     """Test the enhanced binary market data functionality with OHLC support."""

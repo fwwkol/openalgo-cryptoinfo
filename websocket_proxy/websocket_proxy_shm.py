@@ -247,12 +247,36 @@ class HighPerformanceWebSocketProxy:
             # Handle BinaryMarketData format (optimized)
             if hasattr(message, 'to_normalized_data'):
                 data = message.to_normalized_data()
+                # FIX: Use the exchange from the normalized data directly
                 return data['symbol'], data['exchange'], data['mode'], data
-                
+            
             elif hasattr(message, 'to_market_data_message'):
                 # Optimized legacy binary format handling
                 symbol = message.get_symbol_string()
                 mode = message.message_type
+                
+                # FIX: Enhanced exchange mapping for index symbols
+                exchange_map = {
+                    0: 'NSE',
+                    1: 'NSE', 
+                    2: 'BSE', 
+                    3: 'MCX', 
+                    4: 'NFO',
+                    # Add special handling for index symbols
+                    5: 'NSE_INDEX',
+                    6: 'BSE_INDEX'
+                }
+                
+                # Check if this is an index symbol by token or symbol pattern
+                if symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX', 'BANKEX'] or 'INDEX' in symbol:
+                    if message.exchange_id <= 1:  # NSE-based index
+                        exchange = 'NSE_INDEX'
+                    elif message.exchange_id == 2:  # BSE-based index  
+                        exchange = 'BSE_INDEX'
+                    else:
+                        exchange = exchange_map.get(message.exchange_id, 'NSE')
+                else:
+                    exchange = exchange_map.get(message.exchange_id, 'NSE')
                 
                 # Fast exchange mapping with bounds checking
                 exchange_map = ['', 'NSE', 'BSE', 'MCX', 'NFO']
