@@ -451,23 +451,61 @@
             return;
         }
 
-        const message = {
-            action: 'subscribe',
-            symbols: [{symbol: symbol, exchange: exchange}],
-            mode: mode
+        // Validate inputs
+        if (!symbol || !exchange || !mode) {
+            logEvent('Error: Symbol, exchange, and mode are required for subscription', 'error');
+            return;
+        }
+
+        // Clean and validate the symbol
+        const cleanSymbol = symbol.trim();
+        if (!cleanSymbol) {
+            logEvent('Error: Symbol cannot be empty', 'error');
+            return;
+        }
+
+        // Ensure exchange and mode are uppercase
+        const cleanExchange = exchange.toUpperCase();
+        const cleanMode = mode.toUpperCase();
+
+        // Map the mode to the numeric value expected by the server
+        const modeMap = {
+            'LTP': 1,
+            'QUOTE': 2,
+            'DEPTH': 3
         };
         
-        socket.send(JSON.stringify(message));
+        const modeNumber = modeMap[cleanMode] || 1; // Default to LTP if mode is invalid
+
+        // Create the subscription message in the format expected by the server
+        const message = {
+            action: 'subscribe',
+            symbol: cleanSymbol,
+            exchange: cleanExchange,
+            mode: modeNumber
+        };
         
-        if (!isRestore) {
-            logEvent(`📤 Sent subscribe: ${JSON.stringify(message)}`, 'info');
-            subscriptions.add(`${exchange}:${symbol}:${mode}`);
-            logEvent(`✅ Subscribing to ${exchange}:${symbol} (${mode})`, 'success');
-        } else {
-            logEvent(`🔄 Restoring subscription: ${exchange}:${symbol} (${mode})`, 'info');
+        try {
+            const messageStr = JSON.stringify(message);
+            console.log('Sending subscription:', messageStr); // Debug log
+            
+            socket.send(messageStr);
+            
+            if (!isRestore) {
+                logEvent(`📤 Sent subscribe: ${messageStr}`, 'info');
+                const subKey = `${cleanExchange}:${cleanSymbol}:${cleanMode}`;
+                subscriptions.add(subKey);
+                logEvent(`✅ Subscribing to ${cleanExchange}:${cleanSymbol} (${cleanMode})`, 'success');
+                console.log('Added subscription:', subKey); // Debug log
+            } else {
+                logEvent(`🔄 Restoring subscription: ${cleanExchange}:${cleanSymbol} (${cleanMode})`, 'info');
+            }
+            
+            updateSubscriptionCount();
+        } catch (error) {
+            console.error('Subscription error:', error); // More detailed error logging
+            logEvent(`Error sending subscription: ${error.message}`, 'error');
         }
-        
-        updateSubscriptionCount();
     }
 
     // Unsubscribe from a symbol
