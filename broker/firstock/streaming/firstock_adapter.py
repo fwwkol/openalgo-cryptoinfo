@@ -17,8 +17,8 @@ load_dotenv()
 # Add parent directory to path to allow imports
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../'))
 
-from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
-from websocket_proxy.mapping import SymbolMapper
+from websocket_proxy_zeromq.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy_zeromq.mapping import SymbolMapper
 from .firstock_mapping import FirstockExchangeMapper
 from .firstock_websocket import FirstockWebSocket
 

@@ -16,7 +16,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Now import using relative paths from the project root
-from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy_zeromq.base_adapter import BaseBrokerWebSocketAdapter
 from database.token_db import get_token
 from database.auth_db import get_auth_token
 

@@ -6,8 +6,8 @@ import logging
 from typing import Dict, Any, Optional
 from datetime import datetime
 
-from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
-from websocket_proxy.mapping import SymbolMapper
+from websocket_proxy_zeromq.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy_zeromq.mapping import SymbolMapper
 from .upstox_client import UpstoxWebSocketClient
 from database.auth_db import get_auth_token
 

@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Set, Any, Callable
 
-from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
+from websocket_proxy_zeromq.base_adapter import BaseBrokerWebSocketAdapter
 from database.token_db import get_token
 from database.auth_db import get_auth_token
 
