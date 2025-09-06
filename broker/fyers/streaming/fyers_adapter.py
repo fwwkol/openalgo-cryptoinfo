@@ -41,6 +41,7 @@ class FyersAdapter:
         self.active_subscriptions = {}  # symbol -> subscription_info
         self.subscription_callbacks = {}  # data_type -> callback
         self.symbol_to_hsm = {}  # symbol -> hsm_token mapping
+        self.hsm_to_symbol = {}  # hsm_token -> symbol mapping (reverse lookup)
         
         # Connection state
         self.connected = False
@@ -110,16 +111,34 @@ class FyersAdapter:
         finally:
             self.connecting = False
     
-    def disconnect(self):
-        """Disconnect from Fyers WebSocket"""
+    def disconnect(self, clear_mappings=True):
+        """
+        Disconnect from Fyers WebSocket
+        
+        Args:
+            clear_mappings: If True, clear all mappings. If False, preserve them for reconnection.
+        """
         try:
             self.connected = False
             if self.ws_client:
                 self.ws_client.disconnect()
                 self.ws_client = None
-            self.active_subscriptions.clear()
-            self.symbol_to_hsm.clear()
-            self.logger.info("Disconnected from Fyers WebSocket")
+            
+            # Only clear mappings if requested (for complete disconnect)
+            if clear_mappings:
+                self.active_subscriptions.clear()
+                self.symbol_to_hsm.clear()
+                self.hsm_to_symbol.clear()  # Clear reverse mapping too
+                self.subscription_callbacks.clear()  # Clear callbacks
+                self.last_data.clear()  # Clear deduplication cache
+                self.logger.info("Disconnected from Fyers WebSocket (cleared all mappings)")
+            else:
+                # Keep mappings but clear active subscriptions for reconnection
+                self.active_subscriptions.clear()
+                self.subscription_callbacks.clear()
+                self.last_data.clear()
+                self.logger.info(f"Disconnected from Fyers WebSocket (preserved {len(self.hsm_to_symbol)} mappings)")
+                
         except Exception as e:
             self.logger.error(f"Error during disconnect: {e}")
     
@@ -139,13 +158,16 @@ class FyersAdapter:
         try:
             with self.lock:
                 # Store callback per symbol to prevent data mixing
+                # Use a unique key for each symbol and data type combination
                 for symbol_info in symbols:
                     exchange = symbol_info.get("exchange", "NSE")
                     symbol = symbol_info.get("symbol", "")
                     if symbol:
                         full_symbol = f"{exchange}:{symbol}"
-                        # Store callback per symbol
-                        self.subscription_callbacks[f"{data_type}_{full_symbol}"] = callback
+                        callback_key = f"{data_type}_{full_symbol}"
+                        # Store callback per symbol to ensure proper data routing
+                        self.subscription_callbacks[callback_key] = callback
+                        self.logger.debug(f"Stored callback for {callback_key}")
                 
                 # Store subscription info for tracking
                 valid_symbols = []
@@ -186,6 +208,7 @@ class FyersAdapter:
                     return False
                 
                 # Store HSM mappings for reverse lookup
+                # IMPORTANT: Don't overwrite existing mappings, accumulate them
                 for hsm_token, brsymbol in token_mappings.items():
                     # Map HSM token back to OpenAlgo symbol
                     # The token_mappings now contains brsymbol format
@@ -193,8 +216,11 @@ class FyersAdapter:
                         expected_brsymbol = f"{sub_info['exchange']}:{sub_info['symbol']}"
                         # Check if this brsymbol matches
                         if brsymbol == expected_brsymbol or brsymbol.endswith(sub_info['symbol']):
+                            # Store both forward and reverse mappings
                             self.symbol_to_hsm[full_symbol] = hsm_token
-                            self.logger.info(f"Mapped HSM token: {full_symbol} -> {hsm_token}")
+                            self.hsm_to_symbol[hsm_token] = full_symbol  # Add reverse mapping
+                            self.logger.info(f"Mapped HSM token: {full_symbol} <-> {hsm_token}")
+                            self.logger.info(f"Current HSM mappings count: {len(self.hsm_to_symbol)}")
                             break
                 
                 self.logger.info(f"Subscribing to {len(hsm_tokens)} HSM tokens...")
@@ -268,62 +294,103 @@ class FyersAdapter:
             if not symbol_str:
                 return
             
-            # Find matching subscription and callback
+            # Find matching subscription using HSM token or original symbol
             callback = None
             openalgo_data_type = "Quote"  # Default
             matched_subscription = None
             
-            # Debug: Log what we're trying to match
-            self.logger.info(f"🔍 Trying to match symbol_str='{symbol_str}' against subscriptions:")
-            for fs, si in self.active_subscriptions.items():
-                self.logger.info(f"  - {fs}: {si['exchange']}:{si['symbol']}")
-            
-            # Look for matching subscription based on symbol
-            for full_symbol, sub_info in self.active_subscriptions.items():
-                expected_symbol = f"{sub_info['exchange']}:{sub_info['symbol']}"
-                
-                # Try exact match first
-                if symbol_str == expected_symbol:
-                    matched_subscription = sub_info
-                    self.logger.info(f"✅ Exact match: {symbol_str} -> {full_symbol}")
-                    break
-                
-                # Try alternative formats for the same symbol
-                # Handle exchange and format mismatches
-                
-                # Case 1: Equity symbols - NSE:TCS-EQ should match NSE:TCS
-                if symbol_str.startswith("NSE:") and sub_info['exchange'] == 'NSE':
-                    symbol_part = symbol_str.split(':', 1)[1]
-                    if symbol_part == f"{sub_info['symbol']}-EQ":
-                        matched_subscription = sub_info
-                        self.logger.info(f"✅ Equity match: {symbol_str} -> {full_symbol}")
-                        break
-                
-                # Case 2: Index symbols - NSE:NIFTY50 should match NSE_INDEX:NIFTY
-                if symbol_str.startswith("NSE:") and sub_info['exchange'] == 'NSE_INDEX':
-                    symbol_part = symbol_str.split(':', 1)[1]
-                    if (symbol_part == 'NIFTY50' and sub_info['symbol'] == 'NIFTY') or \
-                       (symbol_part.replace('-INDEX', '') == sub_info['symbol']):
-                        matched_subscription = sub_info
-                        self.logger.info(f"✅ Index match: {symbol_str} -> {full_symbol}")
-                        break
-                
-                # Case 3: Options - NSE:NIFTY25AUG25550PE should match NFO:NIFTY28AUG2525550PE
-                if symbol_str.startswith("NSE:") and sub_info['exchange'] == 'NFO':
-                    symbol_part = symbol_str.split(':', 1)[1]
-                    sub_symbol = sub_info['symbol']
-                    
-                    # Extract core parts for comparison
-                    # NSE:NIFTY25AUG25550PE vs NFO:NIFTY28AUG2525550PE
-                    if 'NIFTY' in symbol_part and 'NIFTY' in sub_symbol:
-                        # Extract strike and expiry info
-                        if '25550' in symbol_part and '25550' in sub_symbol:
+            # Try to match using HSM token first (most reliable)
+            hsm_token = fyers_data.get('hsm_token')
+            if hsm_token:
+                # Use bidirectional mapping for fast lookup
+                if hsm_token in self.hsm_to_symbol:
+                    full_symbol = self.hsm_to_symbol[hsm_token]
+                    if full_symbol in self.active_subscriptions:
+                        matched_subscription = self.active_subscriptions[full_symbol]
+                        self.logger.info(f"✅ Matched by HSM token: {hsm_token} -> {full_symbol}")
+                else:
+                    # Fallback to searching through all subscriptions
+                    for full_symbol, sub_info in self.active_subscriptions.items():
+                        if full_symbol in self.symbol_to_hsm and self.symbol_to_hsm[full_symbol] == hsm_token:
                             matched_subscription = sub_info
-                            self.logger.info(f"✅ Options match: {symbol_str} -> {full_symbol}")
+                            # Update reverse mapping for future fast lookup
+                            self.hsm_to_symbol[hsm_token] = full_symbol
+                            self.logger.info(f"✅ Matched by HSM token (fallback): {hsm_token} -> {full_symbol}")
                             break
             
+            # If no match by HSM token, try matching by original_symbol field
+            if not matched_subscription and 'original_symbol' in fyers_data:
+                original_symbol = fyers_data.get('original_symbol', '')
+                # Try exact match
+                if original_symbol in self.active_subscriptions:
+                    matched_subscription = self.active_subscriptions[original_symbol]
+                    self.logger.info(f"✅ Matched by original_symbol: {original_symbol}")
+                else:
+                    # Try to find a match in active subscriptions
+                    # Handle cases like NSE:NIFTY25SEPFUT -> NFO:NIFTY30SEP25FUT
+                    for full_symbol, sub_info in self.active_subscriptions.items():
+                        # Check for NFO futures match
+                        if sub_info['exchange'] == 'NFO' and 'NIFTY' in original_symbol and 'FUT' in original_symbol:
+                            if 'NIFTY' in sub_info['symbol'] and 'FUT' in sub_info['symbol']:
+                                matched_subscription = sub_info
+                                self.logger.info(f"✅ Matched NFO future by pattern: {original_symbol} -> {full_symbol}")
+                                # Update the mapping for future use
+                                if hsm_token and hsm_token not in self.hsm_to_symbol:
+                                    self.hsm_to_symbol[hsm_token] = full_symbol
+                                    self.symbol_to_hsm[full_symbol] = hsm_token
+                                break
+            
+            # If no match by token, fall back to symbol matching from fyers data
             if not matched_subscription:
+                # Try to match using the symbol from fyers_data
+                fyers_symbol = fyers_data.get('symbol', '')
+                if fyers_symbol:
+                    # Try exact match first
+                    for full_symbol, sub_info in self.active_subscriptions.items():
+                        # Check various matching patterns
+                        if sub_info['symbol'] in fyers_symbol or fyers_symbol.endswith(sub_info['symbol']):
+                            matched_subscription = sub_info
+                            self.logger.info(f"✅ Matched by symbol name: {fyers_symbol} -> {full_symbol}")
+                            # Update the mapping for future use
+                            if hsm_token and hsm_token not in self.hsm_to_symbol:
+                                self.hsm_to_symbol[hsm_token] = full_symbol
+                                self.symbol_to_hsm[full_symbol] = hsm_token
+                            break
+                        # Special case for NFO futures
+                        elif sub_info['exchange'] == 'NFO' and 'FUT' in sub_info['symbol']:
+                            # Extract core symbol from both
+                            fyers_core = fyers_symbol.replace('-EQ', '').split('FUT')[0] if 'FUT' in fyers_symbol else ''
+                            sub_core = sub_info['symbol'].split('FUT')[0] if 'FUT' in sub_info['symbol'] else ''
+                            if fyers_core and sub_core and fyers_core in sub_core:
+                                matched_subscription = sub_info
+                                self.logger.info(f"✅ Matched NFO by core symbol: {fyers_symbol} -> {full_symbol}")
+                                # Update the mapping for future use
+                                if hsm_token and hsm_token not in self.hsm_to_symbol:
+                                    self.hsm_to_symbol[hsm_token] = full_symbol
+                                    self.symbol_to_hsm[full_symbol] = hsm_token
+                                break
+                
+                # If still no match and only one subscription, use it
+                if not matched_subscription and len(self.active_subscriptions) == 1:
+                    for full_symbol, sub_info in self.active_subscriptions.items():
+                        matched_subscription = sub_info
+                        self.logger.info(f"✅ Single subscription match: {full_symbol}")
+                        break
+            
+            # Final check - if still no match, log and return
+            if not matched_subscription:
+                self.logger.warning(f"❌ No HSM token match for data. HSM token: {hsm_token}")
+                self.logger.warning(f"   HSM to Symbol mappings: {self.hsm_to_symbol}")
+                self.logger.warning(f"   Symbol to HSM mappings: {self.symbol_to_hsm}")
+                self.logger.warning(f"   Active subscriptions: {list(self.active_subscriptions.keys())}")
+                self.logger.warning(f"   Fyers symbol: {fyers_data.get('symbol', 'N/A')}")
+                self.logger.warning(f"   Original symbol: {fyers_data.get('original_symbol', 'N/A')}")
                 return
+            
+            """
+            # Complex string matching logic removed - we rely on HSM token matching
+            # This follows the same pattern as Angel adapter which uses token-based matching
+            """
             
             # Get the appropriate callback for this specific symbol
             full_symbol = f"{matched_subscription['exchange']}:{matched_subscription['symbol']}"
