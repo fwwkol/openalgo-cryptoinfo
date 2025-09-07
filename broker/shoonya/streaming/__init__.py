@@ -1,13 +1,17 @@
 """
 Shoonya WebSocket streaming module
 """
-from .shoonya_adapter import ShoonyaWebSocketAdapter
+
+# Remove this line that causes the circular import:
+# from .shoonya_adapter import ShoonyaWebSocketAdapter
+
 from .shoonya_mapping import ShoonyaExchangeMapper, ShoonyaCapabilityRegistry
 from .shoonya_websocket import ShoonyaWebSocket
 
 __all__ = [
-    'ShoonyaWebSocketAdapter',
-    'ShoonyaExchangeMapper', 
+    # Remove 'ShoonyaWebSocketAdapter' from here
+    # 'ShoonyaWebSocketAdapter',
+    'ShoonyaExchangeMapper',
     'ShoonyaCapabilityRegistry',
     'ShoonyaWebSocket'
 ]
