@@ -40,16 +40,6 @@ def create_broker_adapter(broker_name: str) -> Optional[BaseBrokerWebSocketAdapt
         logger.info(f"Creating adapter for broker: {broker_name}")
         return BROKER_ADAPTERS[broker_name]()
     
-    # Try lazy registration for known brokers
-    if broker_name == "flattrade":
-        try:
-            from broker.flattrade.streaming.flattrade_adapter_shm import FlattradeSHMWebSocketAdapter
-            register_adapter("flattrade", FlattradeSHMWebSocketAdapter)
-            logger.debug("Flattrade SHM adapter registered via lazy loading")
-            return FlattradeSHMWebSocketAdapter()
-        except ImportError as e:
-            logger.warning(f"Failed to lazy load Flattrade adapter: {e}")
-    
     # Try dynamic import if not registered
     try:
         # Try to import from broker-specific directory first
