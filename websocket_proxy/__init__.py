@@ -45,6 +45,13 @@ try:
 except ImportError as e:
     logger.debug(f"Kotak SHM adapter not available: {e}")
 
+try:
+    from broker.upstox.streaming.upstox_adapter_shm import UpstoxSHMWebSocketAdapter
+    register_adapter("upstox", UpstoxSHMWebSocketAdapter)
+    logger.debug("Upstox SHM adapter registered")
+except ImportError as e:
+    logger.debug(f"Upstox SHM adapter not available: {e}")
+
 # Add more SHM adapters here as they are created
 # try:
 #     from broker.zerodha.streaming.zerodha_adapter_shm import ZerodhaSHMWebSocketAdapter
