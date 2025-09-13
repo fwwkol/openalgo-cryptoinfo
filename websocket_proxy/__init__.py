@@ -52,6 +52,13 @@ try:
 except ImportError as e:
     logger.debug(f"Upstox SHM adapter not available: {e}")
 
+try:
+    from broker.fyers.streaming.fyers_adapter_shm import FyersSHMWebSocketAdapter
+    register_adapter("fyers", FyersSHMWebSocketAdapter)
+    logger.debug("Fyers SHM adapter registered")
+except ImportError as e:
+    logger.debug(f"Fyers SHM adapter not available: {e}")
+
 # Add more SHM adapters here as they are created
 # try:
 #     from broker.zerodha.streaming.zerodha_adapter_shm import ZerodhaSHMWebSocketAdapter
