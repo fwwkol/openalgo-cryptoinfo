@@ -140,24 +140,24 @@ class FyersSHMWebSocketAdapter:
         self.running = True
         self.logger.info(f"Fyers adapter initialized for user: {user_id}")
     
-    def connect(self) -> bool:
+    def connect(self) -> None:
         """
         Connect to Fyers HSM WebSocket
         
-        Returns:
-            True if connection successful, False otherwise
+        Raises:
+            ConnectionError if connection fails
         """
         if not self.access_token:
             self.logger.error("Access token not available. Call initialize() first.")
-            return False
+            raise ConnectionError("Access token not available. Call initialize() first.")
             
         if self.connected:
             self.logger.warning("Already connected to Fyers WebSocket")
-            return True
+            return
         
         if self.connecting:
             self.logger.warning("Connection already in progress")
-            return False
+            return
         
         try:
             self.connecting = True
@@ -189,15 +189,14 @@ class FyersSHMWebSocketAdapter:
             if self.ws_client.is_connected():
                 self.connected = True
                 self.reconnect_attempts = 0
-                self.logger.info("✅ Connected to Fyers HSM WebSocket")
-                return True
+                self.logger.info("Connected to Fyers HSM WebSocket successfully")
             else:
-                self.logger.error("❌ Failed to authenticate with Fyers HSM WebSocket")
-                return False
+                self.logger.error("Failed to authenticate with Fyers HSM WebSocket")
+                raise ConnectionError("Failed to connect to Fyers WebSocket")
                 
         except Exception as e:
-            self.logger.error(f"❌ Connection error: {e}")
-            return False
+            self.logger.error(f"Connection error: {e}")
+            raise ConnectionError(f"Failed to connect to Fyers WebSocket: {e}")
         finally:
             self.connecting = False
     
