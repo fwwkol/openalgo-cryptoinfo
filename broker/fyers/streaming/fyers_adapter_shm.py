@@ -1,5 +1,5 @@
 """
-Fyers SHM WebSocket Adapter for OpenAlgo - Enhanced Version
+Fyers SHM WebSocket Adapter for OpenAlgo - Enhanced Version with LTP Fix
 Publishes market data directly to the Shared Memory ring buffer with preserved OHLC data.
 Handles WebSocket streaming for all exchanges: NSE, NFO, BSE, BFO, MCX
 Uses HSM binary protocol for real-time data
@@ -613,11 +613,22 @@ class FyersSHMWebSocketAdapter:
             mapped_data["update_type"] = update_type
             mapped_data["timestamp"] = int(time.time() * 1000)
             
-            # Determine mode based on data type
-            if openalgo_data_type == "Depth":
-                mapped_data["mode"] = Config.MODE_DEPTH
-            else:
-                mapped_data["mode"] = Config.MODE_QUOTE
+            # CRITICAL FIX: Determine mode from original subscription, not just data type
+            correlation_id = None
+            matched_mode = Config.MODE_QUOTE  # default fallback
+            
+            # Find the original subscription mode
+            for sub_id, sub_info in self.subscriptions.items():
+                if (sub_info['symbol'] == matched_subscription['symbol'] and 
+                    sub_info['exchange'] == matched_subscription['exchange']):
+                    matched_mode = sub_info['mode']
+                    correlation_id = sub_id
+                    break
+            
+            # Set the mode from subscription
+            mapped_data["mode"] = matched_mode
+            
+            self.logger.debug(f"Processing data for {matched_subscription['exchange']}:{matched_subscription['symbol']} with mode {matched_mode}")
             
             # Deduplication check
             if self._is_duplicate_data(mapped_data):
@@ -641,8 +652,8 @@ class FyersSHMWebSocketAdapter:
             # Always publish to SHM for new pattern
             self._publish_to_shm(mapped_data)
             
-            # Debug logging
-            if openalgo_data_type == "Depth":
+            # Debug logging based on actual mode
+            if matched_mode == Config.MODE_DEPTH:
                 depth = mapped_data.get('depth', {})
                 buy_levels = depth.get('buy', [])
                 sell_levels = depth.get('sell', [])
@@ -650,7 +661,8 @@ class FyersSHMWebSocketAdapter:
                 ask1 = sell_levels[0]['price'] if sell_levels else 'N/A'
                 self.logger.debug(f"🎉 {full_symbol} depth: Bid={bid1}, Ask={ask1}")
             else:
-                self.logger.debug(f"🎉 {full_symbol} data: LTP={mapped_data.get('ltp', 0)}")
+                mode_str = "LTP" if matched_mode == Config.MODE_LTP else "Quote"
+                self.logger.debug(f"🎉 {full_symbol} {mode_str}: LTP={mapped_data.get('ltp', 0)}")
             
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
@@ -775,7 +787,7 @@ class FyersSHMWebSocketAdapter:
 
     def _publish_to_shm(self, data: Dict[str, Any]) -> None:
         """
-        Publish market data to SHM buffer
+        Publish market data to SHM buffer - FIXED FOR LTP MODE
         
         Args:
             data: Normalized market data
@@ -789,11 +801,11 @@ class FyersSHMWebSocketAdapter:
             exchange = data.get('exchange', 'NSE')
             mode = data.get('mode', Config.MODE_QUOTE)
             
-            # Create topic
+            # Create topic based on actual mode
             mode_str = {Config.MODE_LTP: 'LTP', Config.MODE_QUOTE: 'QUOTE', Config.MODE_DEPTH: 'DEPTH'}[mode]
             topic = f"{exchange}_{symbol}_{mode_str}"
             
-            self.logger.debug(f"[APP->SHM] topic={topic} symbol={symbol} payload={json.dumps(data)[:200]}...")
+            self.logger.debug(f"[APP->SHM] topic={topic} symbol={symbol} mode={mode} payload={json.dumps(data)[:200]}...")
             
             # For depth data, preserve full depth structure
             if mode == Config.MODE_DEPTH:
@@ -815,17 +827,19 @@ class FyersSHMWebSocketAdapter:
                     self.logger.debug(f"[APP->SHM] published depth data for symbol={symbol}")
             else:
                 # For LTP/Quote modes, use binary format that preserves OHLC
-                self.logger.debug(f"Publishing OHLC data for {symbol}: O={data.get('open', 0)}, H={data.get('high', 0)}, L={data.get('low', 0)}, C={data.get('close', 0)}")
+                # CRITICAL FIX: Log the mode being processed
+                mode_type = "LTP" if mode == Config.MODE_LTP else "QUOTE"
+                self.logger.debug(f"Publishing {mode_type} data for {symbol}: LTP={data.get('ltp', 0)}, O={data.get('open', 0)}, H={data.get('high', 0)}, L={data.get('low', 0)}, C={data.get('close', 0)}")
                 
                 binary_msg = BinaryMarketData.from_normalized_data(data, exchange)
                 
-                self.logger.debug(f"Binary message created - price: {binary_msg.get_price_float()}, symbol: {binary_msg.get_symbol_string()}, open: {binary_msg.get_open_price_float()}")
+                self.logger.debug(f"Binary message created for {mode_type} - price: {binary_msg.get_price_float()}, symbol: {binary_msg.get_symbol_string()}, open: {binary_msg.get_open_price_float()}")
                 
                 published = self.ring_buffer.publish_single(binary_msg)
                 if not published:
                     self.logger.debug(f"[APP->SHM] publish failed for symbol={symbol} (buffer full)")
                 else:
-                    self.logger.debug(f"[APP->SHM] published symbol={symbol}")
+                    self.logger.debug(f"[APP->SHM] published {mode_type} data for symbol={symbol}")
                 
         except Exception as e:
             self.logger.error(f"Error publishing market data for {symbol}: {e}")
