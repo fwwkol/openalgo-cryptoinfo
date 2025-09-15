@@ -16,8 +16,8 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../'))
 
 try:
-    from websocket_proxy_zeromq.base_adapter import BaseBrokerWebSocketAdapter
-    from websocket_proxy_zeromq.mapping import SymbolMapper
+    from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
+    from websocket_proxy.mapping import SymbolMapper
 except ImportError:
     # Direct import if websocket_proxy module has issues
     import sys
