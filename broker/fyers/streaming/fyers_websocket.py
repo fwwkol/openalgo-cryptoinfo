@@ -326,67 +326,67 @@ class FyersWebSocketClient:
 
     # Message Processing
     def _add_message_to_queue(self, message: bytearray) -> None:
-        """Add message to queue for sending with debug logging"""
-        self.logger.debug(f"📤 Adding message to queue: length={len(message)}, hex={message.hex()[:100]}...")
+        """Add message to queue for sending - optimized"""
         with self.message_lock:
             self.message_queue.append(message)
             self.message_condition.notify()
 
     def _process_message_queue(self) -> None:
-        """Process outgoing message queue with enhanced logging"""
+        """Process outgoing message queue - optimized for high throughput"""
         while not self.message_thread_stop_event.is_set():
             with self.message_lock:
                 while not self.message_thread_stop_event.is_set() and not self.message_queue:
-                    self.message_condition.wait()
+                    self.message_condition.wait(timeout=1.0)  # Add timeout to prevent hanging
                 
                 if self.message_thread_stop_event.is_set():
                     break
                     
-                message = self.message_queue.pop(0)
+                # Process multiple messages at once for better performance
+                messages_to_send = []
+                while self.message_queue and len(messages_to_send) < 10:  # Batch up to 10 messages
+                    messages_to_send.append(self.message_queue.pop(0))
             
-            try:
-                self.logger.debug(f"📨 Sending message: length={len(message)}, hex={message.hex()}")
-                self.ws.send(message, opcode=websocket.ABNF.OPCODE_BINARY)
-                self.logger.debug(f"✅ Message sent successfully")
-            except Exception as e:
-                self.logger.error(f"❌ Failed to send message: {e}")
+            # Send all messages in batch
+            for message in messages_to_send:
+                try:
+                    self.ws.send(message, opcode=websocket.ABNF.OPCODE_BINARY)
+                except Exception as e:
+                    self.logger.error(f"Failed to send message: {e}")
+                    break  # Stop sending if there's an error
 
     def _ping_worker(self) -> None:
-        """Send periodic ping messages with debug logging"""
+        """Send periodic ping messages - optimized"""
         while self.running and self.connected:
             try:
                 if self.ws and self.connected:
                     ping_msg = bytes([0, 1, 11])
-                    self.logger.debug(f"🏓 Sending ping: {ping_msg.hex()}")
                     self.ws.send(ping_msg, opcode=websocket.ABNF.OPCODE_BINARY)
-                time.sleep(10)
+                time.sleep(30)  # Increased ping interval from 10 to 30 seconds for better performance
             except Exception as e:
                 self.logger.error(f"Ping error: {e}")
                 break
 
     def _process_binary_message(self, message: bytes) -> None:
-        """Process incoming binary message with enhanced logging"""
+        """Process incoming binary message - optimized for high throughput"""
         try:
             data = bytearray(message)
-            self.logger.debug(f"📥 Received message: length={len(data)}, hex={data.hex()[:100]}...")
             
             _, resp_type = struct.unpack("!HB", data[:3])
-            self.logger.debug(f"📋 Message type: {resp_type}")
             
-            if resp_type == self.MSG_AUTH_RESPONSE:
+            # Optimized message type handling - most common first
+            if resp_type == self.MSG_DATA_FEED:
+                self._handle_data_feed(data)
+            elif resp_type == self.MSG_AUTH_RESPONSE:
                 self._handle_auth_response(data)
             elif resp_type == self.MSG_SUBSCRIBE_RESPONSE:
                 self._handle_subscribe_response(data)
             elif resp_type == self.MSG_UNSUBSCRIBE_RESPONSE:
                 self._handle_unsubscribe_response(data)
-            elif resp_type == self.MSG_DATA_FEED:
-                self._handle_data_feed(data)
             elif resp_type in [self.MSG_CHANNEL_RESUME, self.MSG_CHANNEL_PAUSE]:
                 self._handle_channel_response(data, resp_type)
             elif resp_type == self.MSG_MODE_RESPONSE:
                 self._handle_mode_response(data)
-            else:
-                self.logger.warning(f"Unknown message type: {resp_type}")
+            # Remove unknown message type logging for performance
                 
         except Exception as e:
             self.logger.error(f"Binary message processing error: {e}")
@@ -420,35 +420,29 @@ class FyersWebSocketClient:
             self.logger.error(f"Auth response processing error: {e}")
 
     def _handle_subscribe_response(self, data: bytearray) -> None:
-        """Handle subscription response with enhanced logging"""
+        """Handle subscription response - optimized"""
         try:
-            self.logger.debug("📊 Processing subscription response")
             offset = 5
             field_length = struct.unpack("H", data[offset:offset + 2])[0]
             offset += 2
             string_val = data[offset:offset + 1].decode("latin-1")
             
-            if string_val == "K":
-                self.logger.info("✅ Subscription successful")
-            else:
-                self.logger.error(f"❌ Subscription failed: {string_val}")
+            if string_val != "K":
+                self.logger.error(f"Subscription failed: {string_val}")
                 
         except Exception as e:
             self.logger.error(f"Subscribe response processing error: {e}")
 
     def _handle_unsubscribe_response(self, data: bytearray) -> None:
-        """Handle unsubscription response with enhanced logging"""
+        """Handle unsubscription response - optimized"""
         try:
-            self.logger.debug("📊 Processing unsubscription response")
             offset = 5
             field_length = struct.unpack("H", data[offset:offset + 2])[0]
             offset += 2
             string_val = data[offset:offset + 1].decode("latin-1")
             
-            if string_val == "K":
-                self.logger.info("✅ Unsubscription successful")
-            else:
-                self.logger.error(f"❌ Unsubscription failed: {string_val}")
+            if string_val != "K":
+                self.logger.error(f"Unsubscription failed: {string_val}")
                 
         except Exception as e:
             self.logger.error(f"Unsubscribe response processing error: {e}")
@@ -497,23 +491,24 @@ class FyersWebSocketClient:
             self.logger.error(f"Channel response processing error: {e}")
 
     def _handle_data_feed(self, data: bytearray) -> None:
-        """Handle market data feed (simplified from SDK)"""
+        """Handle market data feed - optimized for high throughput"""
         try:
             if self.ack_count > 0:
                 self.update_count += 1
                 message_num = struct.unpack(">I", data[3:7])[0]
                 
-                # Send ack less frequently for better performance
-                ack_threshold = max(10, self.ack_count)
+                # Optimized acknowledgment - send ack much less frequently for better performance
+                # This is the key fix for delay issues with high symbol counts
+                ack_threshold = max(100, self.ack_count * 2)  # Increased from 10 to 100+ 
                 if self.update_count >= ack_threshold:
                     ack_msg = self._create_acknowledgment_message(message_num)
                     self._add_message_to_queue(ack_msg)
                     self.update_count = 0
             
             scrip_count = struct.unpack("!H", data[7:9])[0]
-            self.logger.debug(f"📈 Processing data feed with {scrip_count} symbols")
             offset = 9
             
+            # Process all scrips without debug logging for performance
             for _ in range(scrip_count):
                 offset = self._process_single_scrip_data(data, offset)
                 
@@ -543,10 +538,8 @@ class FyersWebSocketClient:
     # ENHANCED MESSAGE CREATION METHODS - Updated from enhanced version
     
     def _create_auth_message_enhanced(self) -> bytearray:
-        """Create authentication message - ENHANCED FORMAT from enhanced version"""
+        """Create authentication message - optimized"""
         try:
-            self.logger.debug(f"🔐 Creating authentication message with HSM token length: {len(self.hsm_token)}")
-            
             buffer_size = 18 + len(self.hsm_token) + len(self.source)
             
             byte_buffer = bytearray()
@@ -574,7 +567,6 @@ class FyersWebSocketClient:
             byte_buffer.extend(struct.pack("!H", len(self.source)))
             byte_buffer.extend(self.source.encode())
             
-            self.logger.debug(f"📤 Auth message created: length={len(byte_buffer)}, hex={byte_buffer.hex()}")
             return byte_buffer
             
         except Exception as e:
@@ -655,10 +647,8 @@ class FyersWebSocketClient:
             return bytearray()
 
     def _create_subscription_message_enhanced(self, symbols: List[str]) -> bytearray:
-        """Create subscription message - ENHANCED FORMAT from enhanced version"""
+        """Create subscription message - optimized"""
         try:
-            self.logger.debug(f"📊 Creating subscription message for {len(symbols)} symbols: {symbols}")
-            
             # Create scrips data
             scrips_data = bytearray()
             scrips_data.extend(struct.pack(">H", len(symbols)))
@@ -667,7 +657,6 @@ class FyersWebSocketClient:
                 scrip_bytes = str(symbol).encode("ascii")
                 scrips_data.append(len(scrip_bytes))
                 scrips_data.extend(scrip_bytes)
-                self.logger.debug(f"   - Adding symbol: {symbol} (length: {len(scrip_bytes)})")
             
             # Create message
             buffer_msg = bytearray()
@@ -686,7 +675,6 @@ class FyersWebSocketClient:
             buffer_msg.extend(struct.pack(">H", 1))
             buffer_msg.append(self.channel_num)
             
-            self.logger.debug(f"Subscription message created: length={len(buffer_msg)}, channel={self.channel_num}, hex={buffer_msg.hex()}")
             return buffer_msg
             
         except Exception as e:
@@ -733,10 +721,8 @@ class FyersWebSocketClient:
             return bytearray()
 
     def _create_acknowledgment_message(self, message_number: int) -> bytearray:
-        """Create acknowledgment message - ENHANCED FORMAT from enhanced version"""
+        """Create acknowledgment message - optimized"""
         try:
-            self.logger.debug(f"Creating acknowledgment message for message_number: {message_number}")
-            
             buffer_msg = bytearray()
             buffer_msg.extend(struct.pack(">H", 9))  # Total size - 2
             buffer_msg.extend(struct.pack("B", 3))   # Request type
@@ -745,7 +731,6 @@ class FyersWebSocketClient:
             buffer_msg.extend(struct.pack(">H", 4))  # Field size
             buffer_msg.extend(struct.pack(">I", message_number))
             
-            self.logger.debug(f"Acknowledgment message created: hex={buffer_msg.hex()}")
             return buffer_msg
             
         except Exception as e:
@@ -818,7 +803,7 @@ class FyersWebSocketClient:
     # Data processing methods (simplified implementations)
     
     def _process_snapshot_data(self, data: bytearray, offset: int) -> int:
-        """Process snapshot data feed with enhanced logging"""
+        """Process snapshot data feed - optimized for high throughput"""
         try:
             topic_id = struct.unpack("H", data[offset:offset + 2])[0]
             offset += 2
@@ -828,8 +813,6 @@ class FyersWebSocketClient:
             
             topic_name = data[offset:offset + topic_name_len].decode("utf-8")
             offset += topic_name_len
-            
-            self.logger.debug(f"Processing snapshot data for topic: {topic_name} (ID: {topic_id})")
             
             # Create response dict
             response = {}
@@ -866,7 +849,7 @@ class FyersWebSocketClient:
                 offset += string_len
                 strings.append(string_data)
             
-            # Build response based on topic type
+            # Build response based on topic type - optimized
             if topic_name[:2] == "sf":  # Symbol feed
                 self.scrips_sym[topic_id] = topic_name
                 response = self._build_scrips_response(field_values, multiplier, precision, strings)
@@ -885,15 +868,21 @@ class FyersWebSocketClient:
             # Store for future updates
             self.response_data[topic_name] = response
             
-            # Trigger callback in adapter's event loop
+            # Optimized callback triggering - direct call when possible
             if hasattr(self, 'adapter_loop') and self.adapter_loop:
-                asyncio.run_coroutine_threadsafe(self._trigger_callback("on_message", response), self.adapter_loop)
+                # Use call_soon_threadsafe for better performance than run_coroutine_threadsafe
+                self.adapter_loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self._trigger_callback("on_message", response))
+                )
             else:
-                # Fallback: call callback directly if no event loop available
+                # Direct callback for maximum performance
                 callback = self.callbacks.get("on_message")
                 if callback:
                     try:
-                        callback(response)
+                        if asyncio.iscoroutinefunction(callback):
+                            asyncio.create_task(callback(response))
+                        else:
+                            callback(response)
                     except Exception as e:
                         self.logger.error(f"Callback error: {e}")
             
@@ -904,15 +893,13 @@ class FyersWebSocketClient:
             return offset
 
     def _process_update_data(self, data: bytearray, offset: int) -> int:
-        """Process update data feed with enhanced logging"""
+        """Process update data feed - optimized for high throughput"""
         try:
             topic_id = struct.unpack("H", data[offset:offset + 2])[0]
             offset += 2
             
             field_count = struct.unpack("B", data[offset:offset + 1])[0]
             offset += 1
-            
-            self.logger.debug(f"Processing update data for topic_id: {topic_id}, fields: {field_count}")
             
             # Get field values
             field_values = []
@@ -921,7 +908,7 @@ class FyersWebSocketClient:
                 offset += 4
                 field_values.append(value)
             
-            # Update existing data
+            # Update existing data - optimized lookup
             topic_name = None
             response = {}
             
@@ -942,15 +929,20 @@ class FyersWebSocketClient:
             
             if topic_name and response:
                 self.response_data[topic_name] = response
-                # Trigger callback in adapter's event loop
+                # Optimized callback triggering
                 if hasattr(self, 'adapter_loop') and self.adapter_loop:
-                    asyncio.run_coroutine_threadsafe(self._trigger_callback("on_message", response), self.adapter_loop)
+                    self.adapter_loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(self._trigger_callback("on_message", response))
+                    )
                 else:
-                    # Fallback: call callback directly if no event loop available
+                    # Direct callback for maximum performance
                     callback = self.callbacks.get("on_message")
                     if callback:
                         try:
-                            callback(response)
+                            if asyncio.iscoroutinefunction(callback):
+                                asyncio.create_task(callback(response))
+                            else:
+                                callback(response)
                         except Exception as e:
                             self.logger.error(f"Callback error: {e}")
             
@@ -961,7 +953,7 @@ class FyersWebSocketClient:
             return offset
 
     def _process_lite_data(self, data: bytearray, offset: int) -> int:
-        """Process lite mode data feed (LTP only) with enhanced logging"""
+        """Process lite mode data feed (LTP only) - optimized for high throughput"""
         try:
             topic_id = struct.unpack("H", data[offset:offset + 2])[0]
             offset += 2
@@ -969,9 +961,7 @@ class FyersWebSocketClient:
             value = struct.unpack(">i", data[offset:offset + 4])[0]
             offset += 4
             
-            self.logger.debug(f"Processing lite data for topic_id: {topic_id}, value: {value}")
-            
-            # Update LTP data
+            # Update LTP data - optimized
             topic_name = None
             response = {}
             
@@ -990,15 +980,20 @@ class FyersWebSocketClient:
             if topic_name and response:
                 response['type'] = 'ltp'
                 self.response_data[topic_name] = response
-                # Trigger callback in adapter's event loop
+                # Optimized callback triggering
                 if hasattr(self, 'adapter_loop') and self.adapter_loop:
-                    asyncio.run_coroutine_threadsafe(self._trigger_callback("on_message", response), self.adapter_loop)
+                    self.adapter_loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(self._trigger_callback("on_message", response))
+                    )
                 else:
-                    # Fallback: call callback directly if no event loop available
+                    # Direct callback for maximum performance
                     callback = self.callbacks.get("on_message")
                     if callback:
                         try:
-                            callback(response)
+                            if asyncio.iscoroutinefunction(callback):
+                                asyncio.create_task(callback(response))
+                            else:
+                                callback(response)
                         except Exception as e:
                             self.logger.error(f"Callback error: {e}")
             
