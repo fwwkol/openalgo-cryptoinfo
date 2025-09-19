@@ -337,53 +337,49 @@ class FyersSHMWebSocketAdapter:
             await self._schedule_reconnection()
 
     async def _on_message_direct(self, data: Dict[str, Any]) -> None:
-        """Direct async message processing - major performance improvement"""
-        # Performance monitoring
+        """Direct async message processing - optimized for high throughput"""
+        # Performance monitoring - reduced frequency
         self.message_count += 1
         current_time = time.time()
-        if current_time - self.last_perf_log > 10:
+        if current_time - self.last_perf_log > 30:  # Reduced from 10 to 30 seconds
             msg_per_sec = self.message_count / (current_time - self.last_perf_log)
             self.logger.info(f"Processing {msg_per_sec:.1f} messages/sec")
             self.message_count = 0
             self.last_perf_log = current_time
 
-        # DEBUG: Log all incoming messages to see what we're receiving
-        self.logger.debug(f"Received message: {data}")
-
         try:
-            # Process market data message
+            # Process market data message directly without debug logging
             await self._process_market_message(data)
                 
         except Exception as e:
             self.logger.error(f"Message processing error: {e}")
 
     async def _process_market_message(self, data: Dict[str, Any]) -> None:
-        """Process market data message from Fyers WebSocket"""
+        """Process market data message from Fyers WebSocket - optimized for speed"""
         try:
             # Extract symbol information from the response
             symbol_key = data.get('symbol', '')  # This would be the HSM symbol
             
-            self.logger.debug(f"Processing market message for symbol_key: {symbol_key}")
-            self.logger.debug(f"Available HSM mappings: {list(self.hsm_symbol_to_symbol.keys())}")
-            
             if not symbol_key or symbol_key not in self.hsm_symbol_to_symbol:
-                self.logger.debug(f"Unknown symbol in message: {symbol_key}")
-                return
+                return  # Skip unknown symbols silently for performance
             
             symbol, exchange = self.hsm_symbol_to_symbol[symbol_key]
             matching_subscriptions = self._find_matching_subscriptions(symbol_key)
             
-            self.logger.debug(f"Found {len(matching_subscriptions)} matching subscriptions for {symbol_key}")
-            
-            for subscription in matching_subscriptions:
-                await self._process_subscription_message(data, subscription, symbol, exchange)
+            # Process all matching subscriptions in parallel for better performance
+            if matching_subscriptions:
+                tasks = [
+                    self._process_subscription_message(data, subscription, symbol, exchange)
+                    for subscription in matching_subscriptions
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
                 
         except Exception as e:
             self.logger.error(f"Market message processing error: {e}")
 
     async def _process_subscription_message(self, data: Dict[str, Any], subscription: Dict[str, Any], 
                                           symbol: str, exchange: str) -> None:
-        """Process single subscription message"""
+        """Process single subscription message - optimized for speed"""
         mode = subscription['mode']
         
         # Normalize market data based on Fyers response format
@@ -403,10 +399,7 @@ class FyersSHMWebSocketAdapter:
         
         topic = f"{exchange}_{symbol}_{mode_name}"
         
-        self.logger.debug(f"Processing subscription message: topic={topic}, symbol={symbol}, exchange={exchange}, mode={mode}")
-        self.logger.debug(f"Normalized data: {normalized}")
-        
-        # Direct publish - no additional queueing
+        # Direct publish - no debug logging for performance
         self._publish_market_data_direct(topic, normalized)
 
     def _normalize_fyers_data(self, data: Dict[str, Any], mode: int) -> Dict[str, Any]:
@@ -476,17 +469,13 @@ class FyersSHMWebSocketAdapter:
         return normalized
 
     def _publish_market_data_direct(self, topic: str, data: Dict[str, Any]) -> None:
-        """Direct publish without additional processing overhead"""
+        """Direct publish without additional processing overhead - optimized for speed"""
         if self.ring_buffer is None:
-            self.logger.warning(f"Ring buffer is None, cannot publish data for {topic}")
             return
         
         try:
             mode = data.get('mode', 1)
-            symbol = data.get('symbol', 'unknown')
-            exchange = data.get('exchange', 'unknown')
-            
-            self.logger.debug(f"Publishing market data for {topic}: symbol={symbol}, exchange={exchange}, mode={mode}")
+            exchange = data.get('exchange', 'NSE')
             
             if mode == Config.MODE_DEPTH or exchange == 'BFO':
                 # Preserve full depth structure and BFO exchange name
@@ -494,21 +483,11 @@ class FyersSHMWebSocketAdapter:
                 ltp_value = data.get('ltp', 0) or data.get('price', 0)
                 enriched_data['price'] = float(ltp_value) if ltp_value else 0.0
                 
-                published = self.ring_buffer.publish_single(enriched_data)
-                if published:
-                    self.logger.debug(f"[APP->SHM] ✅ Published dict data for {symbol}.{exchange}")
-                else:
-                    self.logger.debug(f"[APP->SHM] ❌ Publish failed for symbol={symbol} (buffer full)")
+                self.ring_buffer.publish_single(enriched_data)
             else:
                 # Use binary format for LTP/Quote modes with OHLC preservation
-                # Let BinaryMarketData use the exchange from the data itself
                 binary_msg = BinaryMarketData.from_normalized_data(data)
-                
-                published = self.ring_buffer.publish_single(binary_msg)
-                if published:
-                    self.logger.debug(f"[APP->SHM] ✅ Published binary data for {symbol}.{exchange}")
-                else:
-                    self.logger.debug(f"[APP->SHM] ❌ Publish failed for symbol={symbol} (buffer full)")
+                self.ring_buffer.publish_single(binary_msg)
                     
         except Exception as e:
             self.logger.error(f"Error publishing market data for {topic}: {e}")
