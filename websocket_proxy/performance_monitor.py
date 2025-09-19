@@ -157,10 +157,10 @@ class PerformanceMonitor:
         self.current_metrics = PerformanceMetrics()
         self.metrics_lock = threading.Lock()
         
-        # Historical data (keep last 1000 samples)
-        self.metrics_history: deque = deque(maxlen=1000)
-        self.latency_samples: deque = deque(maxlen=10000)
-        self.throughput_samples: deque = deque(maxlen=1000)
+        # Historical data (reduced for production)
+        self.metrics_history: deque = deque(maxlen=100)
+        self.latency_samples: deque = deque(maxlen=1000)
+        self.throughput_samples: deque = deque(maxlen=100)
         
         # Component references
         self.monitored_components: Dict[str, Any] = {}
@@ -696,48 +696,3 @@ class PerformanceMonitor:
         self.stop_monitoring()
 
 
-def test_performance_monitor():
-    """Test the performance monitor functionality."""
-    print("Testing Performance Monitor...")
-    
-    # Create test thresholds
-    thresholds = PerformanceThresholds(
-        max_buffer_utilization=0.7,
-        max_latency_ms=5.0,
-        min_throughput_msg_per_sec=500.0
-    )
-    
-    # Create alert config
-    alert_config = AlertConfig(
-        enable_console_alerts=True,
-        alert_cooldown_sec=5.0
-    )
-    
-    # Test monitor
-    with PerformanceMonitor(thresholds, alert_config) as monitor:
-        print(f"Created monitor with thresholds: {thresholds}")
-        
-        # Simulate registering components
-        print("Simulating component registration...")
-        
-        # In real usage, you would register actual components:
-        # monitor.register_component("buffer_pool", buffer_pool)
-        # monitor.register_component("consumer", consumer)
-        # monitor.register_component("subscription_manager", sub_manager)
-        
-        # Simulate monitoring
-        time.sleep(2)
-        
-        # Get metrics
-        metrics = monitor.get_current_metrics()
-        print(f"Current metrics: {metrics.to_dict()}")
-        
-        # Get summary
-        summary = monitor.get_performance_summary()
-        print(f"Performance summary: {summary}")
-        
-        print("Performance monitor test completed")
-
-
-if __name__ == "__main__":
-    test_performance_monitor()

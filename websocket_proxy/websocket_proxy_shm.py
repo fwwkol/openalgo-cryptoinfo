@@ -11,6 +11,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from .optimized_ring_buffer import OptimizedRingBuffer
+from .binary_market_data import BinaryMarketData, get_exchange_from_hash
 from .market_data import MarketDataMessage
 from .config import config
 from utils.logging import get_logger
@@ -20,9 +21,7 @@ logger = get_logger(__name__)
 # Import database functions - handle gracefully if not available
 try:
     from database.auth_db import verify_api_key, get_broker_name, get_auth_token
-    logger.debug("Database auth available")
-except ImportError as e:
-    logger.debug(f"Database auth not available: {e}")
+except ImportError:
     verify_api_key = None
     get_broker_name = None
     get_auth_token = None
@@ -30,9 +29,7 @@ except ImportError as e:
 # Import broker factory for dynamic broker creation
 try:
     from .broker_factory import create_broker_adapter
-    logger.debug("Broker factory available")
-except ImportError as e:
-    logger.debug(f"Broker factory not available: {e}")
+except ImportError:
     create_broker_adapter = None
 
 # Configure logging
@@ -69,14 +66,14 @@ class HighPerformanceWebSocketProxy:
         self.user_mapping = {}
         self.user_broker_mapping = {}
 
-        # Performance metrics with more granular tracking
+        # Performance metrics with bounded memory usage
         self.metrics = {
             'messages_received': 0,
             'messages_sent': 0,
             'connection_count': 0,
             'active_connections': 0,
             'errors': 0,
-            'processing_latency_ns': deque(maxlen=1000),  # Track latencies
+            'processing_latency_ns': deque(maxlen=100),  # Reduced for production
             'queue_depth': 0,
             'dropped_messages': 0
         }
@@ -143,7 +140,7 @@ class HighPerformanceWebSocketProxy:
         CRITICAL OPTIMIZATION: Ultra-fast market data processing with direct delivery
         Eliminates queueing bottlenecks and minimizes processing overhead
         """
-        logger.debug("Starting optimized market data processor with direct delivery")
+        logger.info("Starting market data processor")
         
         # Pre-allocate message format template to avoid repeated dict creation
         message_template = {
@@ -226,10 +223,10 @@ class HighPerformanceWebSocketProxy:
                 latency_ns = end_time - start_time
                 self.metrics['processing_latency_ns'].append(latency_ns)
                 
-                # Log performance every 1000 messages
-                if self.metrics['messages_received'] % 1000 == 0:
+                # Log performance every 10000 messages for production
+                if self.metrics['messages_received'] % 10000 == 0:
                     avg_latency_us = sum(self.metrics['processing_latency_ns']) / len(self.metrics['processing_latency_ns']) / 1000
-                    logger.debug(f"Processed {processed_count} messages, avg latency: {avg_latency_us:.2f}μs")
+                    logger.info(f"Processed {self.metrics['messages_received']} messages, avg latency: {avg_latency_us:.2f}μs")
 
             except asyncio.CancelledError:
                 logger.info("Market data processor received cancellation signal")
@@ -255,32 +252,27 @@ class HighPerformanceWebSocketProxy:
                 symbol = message.get_symbol_string()
                 mode = message.message_type
                 
-                # FIX: Enhanced exchange mapping for index symbols
+                # Dynamic exchange mapping - supports all exchanges
                 exchange_map = {
-                    0: 'NSE',
+                    0: 'UNKNOWN',
                     1: 'NSE', 
                     2: 'BSE', 
                     3: 'MCX', 
                     4: 'NFO',
-                    # Add special handling for index symbols
-                    5: 'NSE_INDEX',
-                    6: 'BSE_INDEX'
+                    5: 'BFO',
+                    6: 'NSE_INDEX',
+                    7: 'BSE_INDEX',
+                    8: 'CDS',
+                    9: 'COMMODITY'
                 }
                 
-                # Check if this is an index symbol by token or symbol pattern
-                if symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX', 'BANKEX'] or 'INDEX' in symbol:
-                    if message.exchange_id <= 1:  # NSE-based index
-                        exchange = 'NSE_INDEX'
-                    elif message.exchange_id == 2:  # BSE-based index  
-                        exchange = 'BSE_INDEX'
-                    else:
-                        exchange = exchange_map.get(message.exchange_id, 'NSE')
+                # Try to get original exchange from hash first
+                original_exchange = get_exchange_from_hash(message.symbol_hash)
+                if original_exchange:
+                    exchange = original_exchange
                 else:
-                    exchange = exchange_map.get(message.exchange_id, 'NSE')
-                
-                # Fast exchange mapping with bounds checking
-                exchange_map = ['', 'NSE', 'BSE', 'MCX', 'NFO']
-                exchange = exchange_map[min(max(message.exchange_id, 0), 4)]
+                    # Fallback to exchange ID mapping
+                    exchange = exchange_map.get(message.exchange_id, 'UNKNOWN')
                 
                 # Pre-build data dict with essential fields only
                 data = {
@@ -385,7 +377,9 @@ class HighPerformanceWebSocketProxy:
             raise
         except Exception as e:
             # Log and re-raise for caller to handle
-            logger.debug(f"Send error: {e}")
+            # Log only critical send errors
+            if not isinstance(e, (websockets.exceptions.ConnectionClosed, ConnectionResetError)):
+                logger.warning(f"Send error: {type(e).__name__}")
             raise
 
     async def _batch_processor_optimized(self):
@@ -393,7 +387,7 @@ class HighPerformanceWebSocketProxy:
         OPTIMIZATION: High-performance batch processor for fallback mode only
         Only used when direct_delivery_mode is False
         """
-        logger.debug("Starting optimized batch processor (fallback mode)")
+        logger.info("Starting batch processor (fallback mode)")
         
         while not self.shutdown_event.is_set():
             try:
@@ -489,7 +483,7 @@ class HighPerformanceWebSocketProxy:
                     await self._send_error(websocket, "processing_error", str(e))
 
         except ConnectionClosed:
-            logger.debug(f"Client disconnected: {client_id}")
+            pass  # Normal disconnection, no need to log
         except Exception as e:
             logger.error(f"Connection error with {client_id}: {e}")
         finally:
@@ -555,7 +549,6 @@ class HighPerformanceWebSocketProxy:
                 'user_id': 'anonymous',
                 'broker': 'none'
             })
-            logger.info(f"Client {client['id']} authenticated (auth not required)")
             return
 
         # Verify API key (same as ZeroMQ version)
@@ -592,8 +585,8 @@ class HighPerformanceWebSocketProxy:
             if get_broker_name:
                 try:
                     broker_name = get_broker_name(api_key)
-                except Exception as e:
-                    logger.debug(f"Could not get broker name: {e}")
+                except Exception:
+                    pass  # Broker name lookup failed, continue
 
             if not broker_name:
                 await self._send_message(websocket, {
@@ -632,7 +625,7 @@ class HighPerformanceWebSocketProxy:
                 'broker': broker_name
             })
 
-            logger.info(f"Client {client['id']} authenticated: user_id={user_id}, broker={broker_name}")
+            logger.info(f"Client authenticated: broker={broker_name}")
 
         except Exception as e:
             logger.error(f"Authentication error: {e}")
@@ -726,11 +719,11 @@ class HighPerformanceWebSocketProxy:
             try:
                 adapter = self.broker_adapters[user_id]
                 result = adapter.subscribe(symbol, exchange, mode)
-                logger.debug(f"Broker subscription for {exchange}:{symbol} mode={mode}: {result}")
+                # Broker subscription completed
             except Exception as e:
                 logger.error(f"Broker subscribe error for {symbol}: {e}")
 
-        logger.info(f"Client {client['id']} subscribed to topic: {topic_key}")
+        # Subscription completed
 
         await self._send_success(websocket, 'subscribed', {
             "symbol": symbol,
@@ -780,11 +773,11 @@ class HighPerformanceWebSocketProxy:
             try:
                 adapter = self.broker_adapters[user_id]
                 result = adapter.unsubscribe(symbol, exchange, mode)
-                logger.debug(f"Broker unsubscription for {topic_key}: {result}")
+                # Broker unsubscription completed
             except Exception as e:
                 logger.error(f"Broker unsubscribe error for {topic_key}: {e}")
 
-        logger.info(f"Client {client['id']} unsubscribed from topic: {topic_key}")
+        # Unsubscription completed
 
         await self._send_success(websocket, 'unsubscribed', {
             "symbol": symbol,
@@ -937,7 +930,7 @@ class HighPerformanceWebSocketProxy:
             del self.clients[websocket]
             self.metrics['active_connections'] = len(self.clients)
 
-            logger.info(f"Client cleaned up: {client['id']}")
+            # Client cleanup completed
 
         except Exception as e:
             logger.error(f"Error closing connection: {e}")
@@ -1034,11 +1027,3 @@ async def main():
     """Main entry point for high-performance WebSocket proxy"""
     proxy = HighPerformanceWebSocketProxy()
     await proxy.start()
-
-
-if __name__ == "__main__":
-    # OPTIMIZATION: Set optimal asyncio event loop policy for performance
-    if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
-    asyncio.run(main())

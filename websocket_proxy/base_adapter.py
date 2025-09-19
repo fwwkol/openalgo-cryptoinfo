@@ -19,7 +19,6 @@ class BaseBrokerWebSocketAdapter(ABC):
     
     def __init__(self):
         self.logger = get_logger("broker_adapter")
-        self.logger.info("BaseBrokerWebSocketAdapter initializing (SHM mode)")
         
         try:
             # Initialize instance variables
@@ -30,15 +29,12 @@ class BaseBrokerWebSocketAdapter(ABC):
             shm_buffer_name = os.getenv('SHM_BUFFER_NAME', 'ws_proxy_buffer')
             try:
                 self.ring_buffer = OptimizedRingBuffer(name=shm_buffer_name, create=False)
-                self.logger.info(f"OptimizedRingBuffer initialized with buffer '{shm_buffer_name}'")
             except Exception as e:
-                self.logger.error(f"Failed to initialize OptimizedRingBuffer: {e}")
+                self.logger.error(f"Failed to initialize ring buffer: {e}")
                 self.ring_buffer = None
                 
-            self.logger.info("BaseBrokerWebSocketAdapter initialized successfully")
-            
         except Exception as e:
-            self.logger.error(f"Error in BaseBrokerWebSocketAdapter init: {e}")
+            self.logger.error(f"Error in adapter initialization: {e}")
             raise
     
     @abstractmethod
@@ -93,11 +89,8 @@ class BaseBrokerWebSocketAdapter(ABC):
                 
                 # Publish to ring buffer
                 published = self.ring_buffer.publish_single(binary_msg)
-                if not published:
-                    self.logger.debug("Ring buffer publish returned False (buffer full or not ready)")
                 return published
             else:
-                self.logger.debug("No ring buffer available to publish market data")
                 return False
         except Exception as e:
             self.logger.exception(f"Error publishing market data: {e}")

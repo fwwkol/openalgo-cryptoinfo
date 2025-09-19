@@ -31,6 +31,23 @@ def get_symbol_hash(symbol: str, exchange: str) -> int:
     return _symbol_hash_cache[key]
 
 
+def get_exchange_from_hash(symbol_hash: int) -> Optional[str]:
+    """
+    Reverse lookup to get exchange from symbol hash.
+    
+    Args:
+        symbol_hash: 64-bit hash value
+        
+    Returns:
+        str: Exchange name if found, None otherwise
+    """
+    for key, cached_hash in _symbol_hash_cache.items():
+        if cached_hash == symbol_hash:
+            exchange, symbol = key.split(':', 1)
+            return exchange
+    return None
+
+
 def clear_symbol_hash_cache():
     """Clear the symbol hash cache."""
     global _symbol_hash_cache
@@ -68,13 +85,17 @@ class BinaryMarketData:
     TYPE_QUOTE: ClassVar[int] = 2
     TYPE_DEPTH: ClassVar[int] = 3
     
-    # Exchange ID constants
+    # Exchange ID constants - Dynamic mapping
+    EXCHANGE_UNKNOWN: ClassVar[int] = 0
     EXCHANGE_NSE: ClassVar[int] = 1
     EXCHANGE_BSE: ClassVar[int] = 2
     EXCHANGE_MCX: ClassVar[int] = 3
     EXCHANGE_NFO: ClassVar[int] = 4
-    EXCHANGE_NSE_INDEX: ClassVar[int] = 5  # Add this
-    EXCHANGE_BSE_INDEX: ClassVar[int] = 6  # Add this
+    EXCHANGE_BFO: ClassVar[int] = 5
+    EXCHANGE_NSE_INDEX: ClassVar[int] = 6
+    EXCHANGE_BSE_INDEX: ClassVar[int] = 7
+    EXCHANGE_CDS: ClassVar[int] = 8
+    EXCHANGE_COMMODITY: ClassVar[int] = 9
     
     timestamp_ns: int
     symbol_hash: int
@@ -193,25 +214,30 @@ class BinaryMarketData:
         )
     
     @classmethod
-    def from_normalized_data(cls, data: dict, exchange: str = "NSE") -> 'BinaryMarketData':
+    def from_normalized_data(cls, data: dict, exchange: str = None) -> 'BinaryMarketData':
         """
         Convert from normalized market data dict to BinaryMarketData.
-        This is the key method for preserving OHLC data from Flattrade.
+        Dynamically handles all exchange formats without defaults.
         
         Args:
             data: Normalized market data dictionary
-            exchange: Exchange name for hash computation
+            exchange: Exchange name (if None, uses data['exchange'])
             
         Returns:
             BinaryMarketData: Converted message
         """
         symbol = data.get('symbol', '')
+        
+        # Use exchange from data if not provided
+        if exchange is None:
+            exchange = data.get('exchange', 'UNKNOWN')
+        
         timestamp = data.get('timestamp', time.time() * 1000)
         
         # Convert timestamp to nanoseconds (assuming input is in milliseconds)
         timestamp_ns = int(timestamp * 1_000_000) if timestamp else int(time.time_ns())
         
-        # Get symbol hash
+        # Get symbol hash with exchange information
         symbol_hash = get_symbol_hash(symbol, exchange)
         
         # Convert all prices to fixed-point (multiply by 10000)
@@ -223,7 +249,7 @@ class BinaryMarketData:
         bid_price = int(float(data.get('bid_price', 0) or data.get('best_bid', 0) or 0) * 10000)
         ask_price = int(float(data.get('ask_price', 0) or data.get('best_ask', 0) or 0) * 10000)
         
-        # Map exchange to ID
+        # Map exchange to ID dynamically
         exchange_id = cls._get_exchange_id(exchange)
         
         return cls(
@@ -269,11 +295,18 @@ class BinaryMarketData:
     def to_normalized_data(self) -> dict:
         """
         Convert back to normalized data dictionary with all OHLC fields.
+        Preserves original exchange format when possible.
         
         Returns:
             dict: Normalized market data with OHLC fields
         """
         symbol = self.get_symbol_string()
+        
+        # Try to get original exchange from hash cache first
+        original_exchange = get_exchange_from_hash(self.symbol_hash)
+        if original_exchange is None:
+            # Fallback to exchange ID mapping
+            original_exchange = self._get_exchange_name()
         
         return {
             'symbol': symbol,
@@ -290,7 +323,7 @@ class BinaryMarketData:
             'best_bid': self.get_bid_price_float(),
             'best_ask': self.get_ask_price_float(),
             'mode': self.message_type,
-            'exchange': self._get_exchange_name()
+            'exchange': original_exchange
         }
     
     @classmethod
@@ -374,30 +407,71 @@ class BinaryMarketData:
     
     @staticmethod
     def _get_exchange_id(exchange: str) -> int:
-        """Map exchange name to ID."""
+        """
+        Dynamic exchange mapping - supports all exchange formats.
+        No default fallback to preserve original exchange information.
+        """
+        if not exchange:
+            return BinaryMarketData.EXCHANGE_UNKNOWN
+            
+        exchange_upper = exchange.upper()
+        
+        # Core exchanges
         exchange_map = {
             'NSE': BinaryMarketData.EXCHANGE_NSE,
             'BSE': BinaryMarketData.EXCHANGE_BSE,
             'MCX': BinaryMarketData.EXCHANGE_MCX,
             'NFO': BinaryMarketData.EXCHANGE_NFO,
-            # Add index exchange mappings
-            'NSE_INDEX': 5,  # New exchange ID for NSE indices
-            'BSE_INDEX': 6,  # New exchange ID for BSE indices
+            'BFO': BinaryMarketData.EXCHANGE_BFO,
+            'NSE_INDEX': BinaryMarketData.EXCHANGE_NSE_INDEX,
+            'BSE_INDEX': BinaryMarketData.EXCHANGE_BSE_INDEX,
+            'CDS': BinaryMarketData.EXCHANGE_CDS,
+            'COMMODITY': BinaryMarketData.EXCHANGE_COMMODITY,
         }
-        return exchange_map.get(exchange.upper(), BinaryMarketData.EXCHANGE_NSE)
+        
+        # Check direct mapping first
+        if exchange_upper in exchange_map:
+            return exchange_map[exchange_upper]
+        
+        # Dynamic mapping for broker-specific formats
+        # Handle Fyers format (e.g., 'bse_fo' -> BFO)
+        if exchange_upper == 'BSE_FO':
+            return BinaryMarketData.EXCHANGE_BFO
+        elif exchange_upper == 'NSE_FO':
+            return BinaryMarketData.EXCHANGE_NFO
+        
+        # Handle index patterns
+        if 'INDEX' in exchange_upper:
+            if 'NSE' in exchange_upper or 'NIFTY' in exchange_upper:
+                return BinaryMarketData.EXCHANGE_NSE_INDEX
+            elif 'BSE' in exchange_upper or 'SENSEX' in exchange_upper:
+                return BinaryMarketData.EXCHANGE_BSE_INDEX
+        
+        # Handle commodity patterns
+        if any(keyword in exchange_upper for keyword in ['COMMODITY', 'COMEX', 'NCDEX']):
+            return BinaryMarketData.EXCHANGE_COMMODITY
+        
+        # If no mapping found, return unknown instead of defaulting
+        return BinaryMarketData.EXCHANGE_UNKNOWN
 
     def _get_exchange_name(self) -> str:
-        """Get exchange name from exchange ID."""
+        """
+        Get exchange name from exchange ID.
+        Returns the original exchange format without defaulting.
+        """
         exchange_map = {
+            self.EXCHANGE_UNKNOWN: 'UNKNOWN',
             self.EXCHANGE_NSE: 'NSE',
             self.EXCHANGE_BSE: 'BSE', 
             self.EXCHANGE_MCX: 'MCX',
             self.EXCHANGE_NFO: 'NFO',
-            # Add reverse mappings for indices
-            5: 'NSE_INDEX',
-            6: 'BSE_INDEX',
+            self.EXCHANGE_BFO: 'BFO',
+            self.EXCHANGE_NSE_INDEX: 'NSE_INDEX',
+            self.EXCHANGE_BSE_INDEX: 'BSE_INDEX',
+            self.EXCHANGE_CDS: 'CDS',
+            self.EXCHANGE_COMMODITY: 'COMMODITY',
         }
-        return exchange_map.get(self.exchange_id, 'NSE')
+        return exchange_map.get(self.exchange_id, 'UNKNOWN')
 
     
     def get_symbol_string(self) -> str:
@@ -494,63 +568,3 @@ class BinaryMarketData:
                 f"close={self.get_close_price_float():.4f}, volume={self.volume}, "
                 f"type={self.message_type}, timestamp={timestamp_sec:.6f})")
 
-def test_enhanced_binary_market_data():
-    """Test the enhanced binary market data functionality with OHLC support."""
-    print("Testing Enhanced Binary Market Data with OHLC...")
-    
-    # Test OHLC message creation
-    msg = BinaryMarketData.create_quote_message(
-        symbol="TCS",
-        exchange="NSE", 
-        price=3456.78,
-        open_price=3400.0,
-        high_price=3500.0,
-        low_price=3350.0,
-        close_price=3456.78,
-        bid_price=3456.50,
-        ask_price=3457.00,
-        volume=1000
-    )
-    print(f"Created OHLC message: {msg}")
-    
-    # Test serialization
-    binary_data = msg.to_bytes()
-    print(f"Serialized size: {len(binary_data)} bytes")
-    
-    # Test deserialization
-    msg2 = BinaryMarketData.from_bytes(binary_data)
-    print(f"Deserialized: {msg2}")
-    
-    # Test conversion from normalized data (like from Flattrade)
-    normalized_data = {
-        'symbol': 'NATURALGAS23SEP25255CE',
-        'exchange': 'MCX',
-        'ltp': 17.3,
-        'open': 20.7,
-        'high': 23.85,
-        'low': 16.15,
-        'close': 17.25,
-        'volume': 8965,
-        'timestamp': 1756751064671.0,
-        'mode': 2
-    }
-    
-    binary_from_normalized = BinaryMarketData.from_normalized_data(normalized_data, 'MCX')
-    print(f"From normalized data: {binary_from_normalized}")
-    
-    # Test conversion back to normalized
-    back_to_normalized = binary_from_normalized.to_normalized_data()
-    print(f"Back to normalized: {back_to_normalized}")
-    
-    # Verify OHLC data preservation
-    print("\nOHLC Data Verification:")
-    print(f"Original Open: {normalized_data['open']} -> Binary: {binary_from_normalized.get_open_price_float()}")
-    print(f"Original High: {normalized_data['high']} -> Binary: {binary_from_normalized.get_high_price_float()}")
-    print(f"Original Low: {normalized_data['low']} -> Binary: {binary_from_normalized.get_low_price_float()}")
-    print(f"Original Close: {normalized_data['close']} -> Binary: {binary_from_normalized.get_close_price_float()}")
-    
-    print("Enhanced binary market data tests completed!")
-
-
-if __name__ == "__main__":
-    test_enhanced_binary_market_data()

@@ -20,44 +20,38 @@ logger = logging.getLogger(__name__)
 try:
     from broker.flattrade.streaming.flattrade_adapter_shm import FlattradeSHMWebSocketAdapter
     register_adapter("flattrade", FlattradeSHMWebSocketAdapter)
-    logger.debug("Flattrade SHM adapter registered")
-except ImportError as e:
-    logger.debug(f"Flattrade SHM adapter not available: {e}")
+except ImportError:
+    pass
 
 try:
     from broker.angel.streaming.angel_adapter_shm import AngelSHMWebSocketAdapter
     register_adapter("angel", AngelSHMWebSocketAdapter)
-    logger.debug("Angel SHM adapter registered")
-except ImportError as e:
-    logger.debug(f"Angel SHM adapter not available: {e}")
+except ImportError:
+    pass
 
 try:
     from broker.shoonya.streaming.shoonya_adapter_shm import ShoonyaSHMWebSocketAdapter
     register_adapter("shoonya", ShoonyaSHMWebSocketAdapter)
-    logger.debug("Shoonya SHM adapter registered")
-except ImportError as e:
-    logger.debug(f"Shoonya SHM adapter not available: {e}")
+except ImportError:
+    pass
 
 try:
     from broker.kotak.streaming.kotak_adapter_shm import KotakSHMWebSocketAdapter
     register_adapter("kotak", KotakSHMWebSocketAdapter)
-    logger.debug("Kotak SHM adapter registered")
-except ImportError as e:
-    logger.debug(f"Kotak SHM adapter not available: {e}")
+except ImportError:
+    pass
 
 try:
     from broker.upstox.streaming.upstox_adapter_shm import UpstoxSHMWebSocketAdapter
     register_adapter("upstox", UpstoxSHMWebSocketAdapter)
-    logger.debug("Upstox SHM adapter registered")
-except ImportError as e:
-    logger.debug(f"Upstox SHM adapter not available: {e}")
+except ImportError:
+    pass
 
 try:
     from broker.fyers.streaming.fyers_adapter_shm import FyersSHMWebSocketAdapter
     register_adapter("fyers", FyersSHMWebSocketAdapter)
-    logger.debug("Fyers SHM adapter registered")
-except ImportError as e:
-    logger.debug(f"Fyers SHM adapter not available: {e}")
+except ImportError:
+    pass
 
 # Add more SHM adapters here as they are created
 # try:

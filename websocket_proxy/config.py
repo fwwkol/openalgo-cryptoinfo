@@ -26,11 +26,11 @@ class Config:
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "100"))
     CONSUME_BATCH_SIZE: int = int(os.getenv("CONSUME_BATCH_SIZE", "50"))
     
-    # Logging and monitoring
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    # Logging and monitoring (production optimized)
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "WARNING")
     
-    # Security - Set to True to enable API key authentication
-    AUTH_REQUIRED: bool = os.getenv("AUTH_REQUIRED", "true").lower() == "true"  # Changed default to "true"
+    # Security - Authentication required in production
+    AUTH_REQUIRED: bool = os.getenv("AUTH_REQUIRED", "true").lower() == "true"
     
     # # Broker settings
     # ENABLE_FLATTRADE: bool = os.getenv("ENABLE_FLATTRADE", "true").lower() == "true"

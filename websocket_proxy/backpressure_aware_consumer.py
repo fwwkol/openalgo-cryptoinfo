@@ -31,9 +31,9 @@ class ConsumerStats:
     last_message_time: float = 0.0
     start_time: float = field(default_factory=time.time)
     
-    # Performance tracking
-    latency_samples: deque = field(default_factory=lambda: deque(maxlen=1000))
-    throughput_samples: deque = field(default_factory=lambda: deque(maxlen=100))
+    # Performance tracking (reduced for production)
+    latency_samples: deque = field(default_factory=lambda: deque(maxlen=100))
+    throughput_samples: deque = field(default_factory=lambda: deque(maxlen=50))
     
     def update_latency(self, latency_ms: float):
         """Update latency statistics."""
@@ -548,43 +548,3 @@ class BackpressureAwareConsumer:
         self.stop_consuming()
 
 
-def test_backpressure_aware_consumer():
-    """Test the backpressure aware consumer."""
-    print("Testing Backpressure Aware Consumer...")
-    
-    # This would normally use real buffers
-    # For demo, we'll show the configuration
-    
-    buffer_names = ["test_buffer_0", "test_buffer_1", "test_buffer_2"]
-    
-    config = BackpressureConfig(
-        max_queue_size=5000,
-        batch_size=50,
-        adaptive_batching=True,
-        backpressure_threshold=0.8,
-        drop_strategy="oldest"
-    )
-    
-    print(f"Config: {config}")
-    
-    # Note: In real usage, buffers would exist
-    # consumer = BackpressureAwareConsumer(buffer_names, config)
-    
-    print("Would create consumer with:")
-    print(f"- {len(buffer_names)} buffers")
-    print(f"- Max queue size: {config.max_queue_size}")
-    print(f"- Adaptive batching: {config.adaptive_batching}")
-    print(f"- Drop strategy: {config.drop_strategy}")
-    
-    # Example message handler
-    def handle_message(buffer_id: int, msg):
-        print(f"Buffer {buffer_id}: {msg.get_symbol_string()} @ {msg.get_price_float()}")
-    
-    # consumer.set_global_message_handler(handle_message)
-    # threads = consumer.start_consuming()
-    
-    print("(In production, would start actual consumption)")
-
-
-if __name__ == "__main__":
-    test_backpressure_aware_consumer()
