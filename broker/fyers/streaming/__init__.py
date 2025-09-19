@@ -1,1 +1,3 @@
-# Fyers HSM WebSocket Streaming Module
+from .fyers_adapter_shm import FyersSHMWebSocketAdapter
+
+__all__ = ['FyersSHMWebSocketAdapter']
