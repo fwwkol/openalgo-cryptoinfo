@@ -5,14 +5,14 @@ services:
       context: .
       dockerfile: Dockerfile
 
-    container_name: openalgo-web-beta
+    container_name: openalgo-beta
     ports:
       - "${FLASK_PORT:-5000}:5000"
       - "${WEBSOCKET_PORT:-8765}:8765"
 
     # persistent DB, logs + mount the host .env read-only so dotenv can read it
     volumes:
-      - openalgo_db:/app/db
+      - openalgo_beta_db:/app/db
       - /var/www/docker-volume/oalgo-beta/log:/app/log
       - /var/www/docker-volume/oalgo-beta/logs:/app/logs
       - /var/www/docker-volume/oalgo-beta/strategies:/app/strategies
@@ -28,5 +28,5 @@ services:
 
 # Define named volumes for database persistence
 volumes:
-  openalgo_db:
+  openalgo_beta_db:
     driver: local
